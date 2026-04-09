@@ -463,17 +463,26 @@ MEDIA:/绝对路径
 examples/systemd/hermes-napcat-qq-bridge.service
 ```
 
+这是用户级 service，不是系统级 service。
+
 你可以把它复制到：
 
 ```bash
-/etc/systemd/system/hermes-napcat-qq-bridge.service
+~/.config/systemd/user/hermes-napcat-qq-bridge.service
 ```
 
 然后：
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now hermes-napcat-qq-bridge
+systemctl --user daemon-reload
+systemctl --user enable --now hermes-napcat-qq-bridge
+systemctl --user status hermes-napcat-qq-bridge
+```
+
+如果你希望退出登录后它仍然继续运行，再执行：
+
+```bash
+sudo loginctl enable-linger $USER
 ```
 
 ## 测试
