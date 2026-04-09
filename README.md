@@ -485,6 +485,8 @@ systemctl --user status hermes-napcat-qq-bridge
 sudo loginctl enable-linger $USER
 ```
 
+如果你只是排障时想看更详细的桥日志，再临时给 `ExecStart` 末尾加 `-v`，平时长期运行不建议开。
+
 ## 测试
 
 如果你要跑测试：
