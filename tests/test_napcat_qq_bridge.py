@@ -197,6 +197,19 @@ def test_sanitize_output_filters_cli_noise_and_duplicate_blocks(bridge, make_cfg
     )
 
 
+def test_sanitize_output_prefers_final_tail_after_streaming_overlap(bridge, make_cfg):
+    runner = bridge.HermesRunner(make_cfg())
+    raw = (
+        "目前没有。\n\n"
+        "我这边只看到你发过图片，\n"
+        "目前没有。\n\n"
+        "我这边只看到你发过图片，\n"
+        "还没看到语音文件。"
+    )
+
+    assert runner._sanitize_output(raw) == "目前没有。\n\n我这边只看到你发过图片，\n还没看到语音文件。"
+
+
 def test_group_message_requires_mention_or_reply(bridge, make_cfg):
     app = bridge.BridgeApp(make_cfg())
     app.bot_user_id = "42"
@@ -210,6 +223,36 @@ def test_group_message_requires_mention_or_reply(bridge, make_cfg):
     assert app.should_process_group_event(plain_event, source) is False
     assert app.should_process_group_event(mention_event, source) is True
     assert app.should_process_group_event(reply_event, source) is True
+
+
+def test_private_send_file_prefers_online_file_action(bridge):
+    client = bridge.NapCatClient("http://127.0.0.1:3000", token="abc", timeout=12)
+    source = bridge.EventSource(user_id="10001", group_id=None, message_id="1", self_id="42", raw={})
+    calls = []
+
+    def fake_call(action, params=None):
+        calls.append((action, params))
+        return {"status": "ok", "data": {}}
+
+    client.call = fake_call
+    client.upload_file_stream = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not upload for private online-file happy path"))
+    client.send_file(source, "/tmp/demo.txt", "demo.txt")
+
+    assert calls == [("send_online_file", {"user_id": "10001", "file_path": "/tmp/demo.txt", "file_name": "demo.txt"})]
+
+
+def test_build_prompt_resolves_online_file_segments(bridge, make_cfg):
+    app = bridge.BridgeApp(make_cfg())
+    source = bridge.EventSource(user_id="10001", group_id=None, message_id="7", self_id="42", raw={})
+    app.resolve_online_file = lambda src, data: "/tmp/inbox/report.pdf"
+    event = {
+        "message": [{"type": "onlinefile", "data": {"msgId": "m1", "elementId": "e1", "fileName": "report.pdf"}}],
+        "sender": {"nickname": "tester"},
+    }
+
+    prompt = app.build_prompt(event, source)
+
+    assert "用户发送了在线文件：/tmp/inbox/report.pdf" in prompt
 
 
 def test_reset_command_clears_session_and_pending_queue(bridge, make_cfg):
@@ -277,6 +320,48 @@ def test_enqueue_interrupts_running_process_and_merges_pending_text(bridge, make
     assert "".join(seg.get("data", {}).get("text", "") for seg in merged_segments if seg.get("type") == "text") == "第一条\n第二条"
 
 
+def test_enqueue_requeues_interrupted_active_task_once(bridge, make_cfg):
+    app = bridge.BridgeApp(make_cfg())
+    source = bridge.EventSource(user_id="10001", group_id=None, message_id="2", self_id="42", raw={})
+    chat_key = app.chat_key(source)
+    state = app._chat_state(chat_key)
+    state.worker_active = True
+    state.active_task = bridge.QueuedEvent(
+        source=source,
+        event={"message": [{"type": "text", "data": {"text": "正在处理"}}]},
+        chat_key=chat_key,
+    )
+
+    class FakeProc:
+        def __init__(self):
+            self.running = True
+            self.terminate_calls = 0
+
+        def poll(self):
+            return None if self.running else 0
+
+        def terminate(self):
+            self.terminate_calls += 1
+            self.running = False
+
+        def wait(self, timeout=None):
+            return 0
+
+    proc = FakeProc()
+    state.active_process = proc
+    event = {"message": [{"type": "text", "data": {"text": "后续补充"}}], "sender": {"nickname": "tester"}}
+
+    app.enqueue_event(source, event)
+    assert proc.terminate_calls == 1
+    assert state.pending_task is not None
+    merged_text = "".join(
+        seg.get("data", {}).get("text", "")
+        for seg in app.message_segments(state.pending_task.event)
+        if seg.get("type") == "text"
+    )
+    assert merged_text == "正在处理\n后续补充"
+
+
 def test_group_chat_key_isolated_per_user(bridge, make_cfg):
     app = bridge.BridgeApp(make_cfg())
     source = bridge.EventSource(user_id="10001", group_id="20001", message_id="1", self_id="42", raw={})
@@ -320,3 +405,35 @@ def test_bootstrap_candidates_only_recover_recent_unreplied_messages(bridge, mak
 
     assert "private:10001:fresh-user" in candidates
     assert "private:10001:old-user" not in candidates
+
+
+def test_gap_recovery_replays_missing_history_messages(bridge, make_cfg):
+    app = bridge.BridgeApp(make_cfg())
+    source = bridge.EventSource(user_id="10001", group_id=None, message_id="current", self_id="42", raw={})
+    app._target_sequences[app.history_target_key(source)] = 10
+    handled = []
+    app.handle_event = lambda event, origin="webhook": handled.append((origin, event.get("real_seq")))
+    app.napcat.get_friend_msg_history = lambda user_id, count=20: [
+        {"post_type": "message", "message_type": "private", "user_id": "10001", "self_id": "42", "message_id": "m11", "real_seq": "11", "message": "a"},
+        {"post_type": "message_sent", "message_type": "private", "user_id": "42", "self_id": "42", "message_id": "m12", "real_seq": "12", "message": "self"},
+        {"post_type": "message", "message_type": "private", "user_id": "10001", "self_id": "42", "message_id": "m13", "real_seq": "13", "message": "b"},
+    ]
+
+    app.recover_gap_if_needed(
+        {"post_type": "message", "message_type": "private", "user_id": "10001", "self_id": "42", "message_id": "m14", "real_seq": "14", "message": "current"},
+        source,
+        origin="webhook",
+    )
+
+    assert handled == [("gap-replay", "11"), ("gap-replay", "13")]
+
+
+def test_build_arg_parser_keeps_polling_enabled_by_default(bridge, monkeypatch):
+    for key in list(bridge.os.environ):
+        if key.startswith("NAPCAT_QQ_BRIDGE_POLL_"):
+            monkeypatch.delenv(key, raising=False)
+    parser = bridge.argparse.ArgumentParser()
+    bridge.build_arg_parser(parser)
+    args = parser.parse_args([])
+
+    assert args.poll_interval == 3.0

@@ -84,6 +84,8 @@ class ChatSessionState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     worker_active: bool = False
     active_process: Optional[subprocess.Popen] = None
+    active_task: Optional[QueuedEvent] = None
+    active_task_requeued: bool = False
     pending_task: Optional[QueuedEvent] = None
     cancel_requested: bool = False
     interrupt_requested: bool = False
@@ -222,12 +224,26 @@ class NapCatClient:
         self._send_segments(source, [{"type": "video", "data": {"file": remote_path}}])
 
     def send_file(self, source: EventSource, file_path: str, file_name: Optional[str] = None) -> None:
-        remote_path = self.upload_file_stream(file_path, chunk_size=self.chunk_size)
-        file_name = file_name or Path(file_path).name
+        resolved = Path(file_path).expanduser().resolve()
+        file_name = file_name or resolved.name
         if source.group_id:
+            remote_path = self.upload_file_stream(file_path, chunk_size=self.chunk_size)
             self.call("upload_group_file", {"group_id": source.group_id, "file": remote_path, "name": file_name})
         else:
-            self.call("upload_private_file", {"user_id": source.user_id, "file": remote_path, "name": file_name})
+            try:
+                self.call("send_online_file", {"user_id": source.user_id, "file_path": str(resolved), "file_name": file_name})
+                return
+            except Exception:
+                remote_path = self.upload_file_stream(file_path, chunk_size=self.chunk_size)
+                self.call("upload_private_file", {"user_id": source.user_id, "file": remote_path, "name": file_name})
+
+    def get_online_file_messages(self, user_id: str) -> List[dict]:
+        data = self.call("get_online_file_msg", {"user_id": user_id}).get("data", {})
+        messages = data.get("msgList", data) if isinstance(data, dict) else data
+        return messages if isinstance(messages, list) else []
+
+    def receive_online_file(self, user_id: str, msg_id: str, element_id: str) -> Any:
+        return self.call("receive_online_file", {"user_id": user_id, "msg_id": msg_id, "element_id": element_id}).get("data")
 
     def _send_segments(self, source: EventSource, segments: List[dict]) -> None:
         params: Dict[str, Any] = {"message": segments}
@@ -379,7 +395,73 @@ class HermesRunner:
                 continue
             collapsed.append(paragraphs[idx])
             idx += 1
-        return "\n\n".join(collapsed)
+        return self._prefer_final_tail_after_streaming("\n\n".join(collapsed))
+
+    def _prefer_final_tail_after_streaming(self, text: str) -> str:
+        paragraphs = [part.strip() for part in re.split(r"\n{2,}", text) if part.strip()]
+        if len(paragraphs) < 3:
+            return "\n\n".join(paragraphs)
+        best_start: Optional[int] = None
+        best_score = 0
+        for later_start in range(1, len(paragraphs)):
+            later_tail = paragraphs[later_start:]
+            if len(later_tail) < 2:
+                continue
+            later_text = "\n\n".join(later_tail)
+            for earlier_start in range(later_start):
+                earlier_block = paragraphs[earlier_start:later_start]
+                if len(earlier_block) >= 2:
+                    earlier_text = "\n\n".join(earlier_block)
+                    if len(later_text) > len(earlier_text) and later_text.startswith(earlier_text):
+                        score = len(earlier_block) * 1000 + len(earlier_text)
+                        if score > best_score:
+                            best_score = score
+                            best_start = later_start
+                        continue
+                overlap = 0
+                while (
+                    earlier_start + overlap < later_start
+                    and later_start + overlap < len(paragraphs)
+                    and paragraphs[earlier_start + overlap] == paragraphs[later_start + overlap]
+                ):
+                    overlap += 1
+                if overlap < 2 or earlier_start + overlap != later_start:
+                    continue
+                score = overlap * 100 + len(later_text)
+                if score > best_score:
+                    best_score = score
+                    best_start = later_start
+        result = "\n\n".join(paragraphs[best_start:]) if best_start is not None else "\n\n".join(paragraphs)
+        return self._prefer_final_tail_by_lines(result)
+
+    def _prefer_final_tail_by_lines(self, text: str) -> str:
+        lines = [line.rstrip() for line in text.splitlines()]
+        if len(lines) < 4:
+            return "\n".join(lines).strip()
+        best_start: Optional[int] = None
+        best_score = 0
+        for later_start in range(1, len(lines)):
+            later_tail = lines[later_start:]
+            if len(later_tail) < 2:
+                continue
+            later_text = "\n".join(later_tail).strip()
+            if not later_text:
+                continue
+            for earlier_start in range(later_start):
+                earlier_block = lines[earlier_start:later_start]
+                if len(earlier_block) < 2:
+                    continue
+                earlier_text = "\n".join(earlier_block).strip()
+                if not earlier_text:
+                    continue
+                if len(later_text) > len(earlier_text) and later_text.startswith(earlier_text):
+                    score = len(earlier_block) * 1000 + len(earlier_text)
+                    if score > best_score:
+                        best_score = score
+                        best_start = later_start
+        if best_start is not None:
+            return "\n".join(lines[best_start:]).strip()
+        return "\n".join(lines).strip()
 
 
 class SessionStore:
@@ -439,6 +521,8 @@ class BridgeApp:
         self._chat_states_lock = threading.Lock()
         self._seen_events: Dict[str, float] = {}
         self._seen_events_lock = threading.Lock()
+        self._target_sequences: Dict[str, int] = {}
+        self._target_sequences_lock = threading.Lock()
         self._poll_bootstrapped: Set[str] = set()
         self._poll_bootstrapped_lock = threading.Lock()
         self._poll_stop = threading.Event()
@@ -496,6 +580,8 @@ class BridgeApp:
         source = self.build_source(normalized)
         if not source.user_id:
             return 400, {"ok": False, "error": "missing user_id"}
+        self.recover_gap_if_needed(normalized, source, origin=origin)
+        self._remember_target_sequence(source, normalized)
         dedupe_key = self.event_dedupe_key(normalized, source)
         if dedupe_key and not self._remember_event(dedupe_key):
             if self.cfg.verbose:
@@ -644,10 +730,14 @@ class BridgeApp:
                 worker = threading.Thread(target=self._worker_loop, args=(task,), daemon=True)
                 worker.start()
                 return 1
-            state.pending_task = self.merge_queued_event(state.pending_task, task)
+            merged_pending = self.merge_queued_event(state.pending_task, task)
             if state.active_process is not None and state.active_process.poll() is None:
+                if state.active_task is not None and not state.active_task_requeued:
+                    merged_pending = self.merge_queued_event(state.active_task, merged_pending)
+                    state.active_task_requeued = True
                 state.interrupt_requested = True
                 proc = state.active_process
+            state.pending_task = merged_pending
             queue_size = 1 if state.pending_task is not None else 0
         if proc is not None:
             self._terminate_process(proc)
@@ -656,12 +746,18 @@ class BridgeApp:
     def _worker_loop(self, task: QueuedEvent) -> None:
         state = self._chat_state(task.chat_key)
         while True:
+            with state.lock:
+                state.active_task = task
+                state.active_task_requeued = False
             if self._consume_cancel_requested(state):
                 if self.cfg.verbose:
                     self.log(f"cancelled chat={task.chat_key} before start")
             else:
                 self._process_task(task)
             with state.lock:
+                if state.active_task is task:
+                    state.active_task = None
+                state.active_task_requeued = False
                 task = state.pending_task
                 state.pending_task = None
                 if task is None:
@@ -804,6 +900,84 @@ class BridgeApp:
     def _clear_interrupt_requested(self, state: ChatSessionState) -> None:
         with state.lock:
             state.interrupt_requested = False
+
+    def history_target_key(self, source: EventSource) -> str:
+        if source.group_id:
+            return f"group:{source.group_id}"
+        return f"private:{source.user_id}"
+
+    def event_sequence(self, event: dict) -> Optional[int]:
+        for key in ("real_seq", "message_seq"):
+            value = event.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return int(str(value))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _remember_target_sequence(self, source: EventSource, event: dict) -> None:
+        seq = self.event_sequence(event)
+        if seq is None:
+            return
+        target_key = self.history_target_key(source)
+        with self._target_sequences_lock:
+            current = self._target_sequences.get(target_key)
+            if current is None or seq > current:
+                self._target_sequences[target_key] = seq
+
+    def recover_gap_if_needed(self, event: dict, source: EventSource, origin: str) -> None:
+        if origin != "webhook":
+            return
+        seq = self.event_sequence(event)
+        if seq is None:
+            return
+        target_key = self.history_target_key(source)
+        with self._target_sequences_lock:
+            previous = self._target_sequences.get(target_key)
+        if previous is None or seq <= previous + 1:
+            return
+        missing = seq - previous - 1
+        history_count = min(max(self.cfg.poll_history_count, missing + 8, 20), 200)
+        self.log(
+            f"webhook gap detected target={target_key} prev_seq={previous} current_seq={seq} "
+            f"missing={missing}; attempting one-shot history recovery count={history_count}"
+        )
+        try:
+            if source.group_id:
+                history = self.napcat.get_group_msg_history(source.group_id, count=history_count)
+            else:
+                history = self.napcat.get_friend_msg_history(source.user_id, count=history_count)
+        except Exception as exc:
+            self.log(f"history recovery failed target={target_key}: {exc}")
+            return
+        recovered = 0
+        ordered = sorted(
+            (msg for msg in history if isinstance(msg, dict)),
+            key=lambda item: (
+                self.event_sequence(item) if self.event_sequence(item) is not None else float(item.get("time") or 0),
+                str(item.get("message_id") or ""),
+            ),
+        )
+        for message in ordered:
+            if self.is_self_message(message):
+                continue
+            msg_source = self.build_source(message)
+            if self.history_target_key(msg_source) != target_key:
+                continue
+            msg_seq = self.event_sequence(message)
+            if msg_seq is None or msg_seq <= previous or msg_seq >= seq:
+                continue
+            self.handle_event(message, origin="gap-replay")
+            recovered += 1
+        if recovered:
+            self.log(f"history recovery queued {recovered} missing message(s) target={target_key}")
+            return
+        self.log(
+            f"history recovery found no recoverable messages target={target_key} "
+            f"prev_seq={previous} current_seq={seq}"
+        )
 
     def event_dedupe_key(self, event: dict, source: EventSource) -> Optional[str]:
         message_id = source.message_id or event.get("message_id")
@@ -1054,6 +1228,13 @@ class BridgeApp:
                 if local:
                     attachment_lines.append(f"用户发送了文件：{local}")
                 continue
+            if seg_type == "onlinefile":
+                local = self.resolve_online_file(source, data)
+                if local:
+                    attachment_lines.append(f"用户发送了在线文件：{local}")
+                else:
+                    attachment_lines.append(f"用户发送了在线文件：{self.guess_name(data, 'online-file.bin')}")
+                continue
             raw = json.dumps(seg, ensure_ascii=False)
             text_parts.append(f"[消息段:{seg_type}] {raw}")
 
@@ -1132,6 +1313,27 @@ class BridgeApp:
                 return base64_path
             candidates = [meta.get("url"), meta.get("download_url"), meta.get("file")] + candidates
         return self.download_first(candidates, prefix="file", fallback_name=self.guess_name(data, "file.bin"))
+
+    def resolve_online_file(self, source: EventSource, data: dict) -> Optional[str]:
+        msg_id = str(data.get("msgId") or data.get("msg_id") or "") or None
+        element_id = str(data.get("elementId") or data.get("element_id") or "") or None
+        candidates: List[Optional[str]] = [data.get("path"), data.get("file"), data.get("url")]
+        if not source.group_id and msg_id and element_id:
+            try:
+                received = self.napcat.receive_online_file(source.user_id, msg_id, element_id)
+            except Exception:
+                received = None
+            if isinstance(received, dict):
+                candidates = [
+                    received.get("path"),
+                    received.get("file"),
+                    received.get("file_path"),
+                    received.get("save_path"),
+                    received.get("url"),
+                ] + candidates
+            elif isinstance(received, str):
+                candidates = [received] + candidates
+        return self.download_first(candidates, prefix="onlinefile", fallback_name=self.guess_name(data, "online-file.bin"))
 
     def guess_name(self, data: dict, fallback: str) -> str:
         for key in ("name", "file_name", "file", "path"):
