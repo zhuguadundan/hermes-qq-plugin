@@ -8,3 +8,5 @@ htmlcov/
 .venv/
 venv/
 .DS_Store
+napcat_qq_bridge/config.json
+napcat_qq_bridge/bridge.runtime.log

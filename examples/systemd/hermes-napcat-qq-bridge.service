@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/YOUR_USER
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/YOUR_USER/.hermes/hermes-agent/venv/bin/python3 /home/YOUR_USER/.hermes/plugins/napcat_qq_bridge/bridge.py run --onebot-url http://127.0.0.1:3000 --onebot-token YOUR_ONEBOT_TOKEN --listen-host 127.0.0.1 --listen-port 8096 --webhook-path /napcat --allow-user YOUR_QQ --allow-group YOUR_GROUP --hermes-workdir /home/YOUR_USER --hermes-toolsets terminal,file,web
+ExecStart=/home/YOUR_USER/.hermes/hermes-agent/venv/bin/python3 /home/YOUR_USER/.hermes/plugins/napcat_qq_bridge/bridge.py run --config-file /home/YOUR_USER/.hermes/napcat_qq_bridge/config.json
 Restart=always
 RestartSec=3
 

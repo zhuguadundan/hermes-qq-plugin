@@ -1,20 +1,21 @@
 # Hermes QQ Plugin
 
-一个给 Hermes Agent 用的 QQ 桥接插件。  
-基于 NapCat OneBot HTTP，把 QQ 私聊/群聊消息转给本机 Hermes，再把文本、图片、语音、视频、文件回发到 QQ。
+NapCat + Hermes 的 QQ 桥接插件仓库。
 
-## 功能
+当前主方案是：
 
-- 私聊 / 群聊接入 Hermes
-- 每个聊天独立 session，自动 `--resume`
-- 同一聊天串行处理，follow-up 会中断并合并
-- 支持 `/new` `/reset` `/status` `/stop` `/help`
-- 支持图片、语音、视频、文件收发
-- webhook 正常时优先用 webhook
-- webhook 丢事件时，自动用历史轮询兜底
-- 过滤 Hermes CLI 噪音，减少“重复回复”
+- **入站：OneBot WebSocket Server（纯 WS）**
+- **出站：OneBot HTTP API**
 
-## 仓库结构
+这样做的目的很明确：
+
+- 避免 HTTP webhook 单次投递丢消息
+- 避免 HTTP / WS 双路重复投递
+- 在 WS 断线重连后做一次历史补拉，提升真实场景稳定性
+
+---
+
+## 目录结构
 
 ```text
 .
@@ -22,18 +23,45 @@
 │   ├── __init__.py
 │   ├── bridge.py
 │   ├── cli.py
-│   └── plugin.yaml
+│   ├── config.example.json
+│   ├── plugin.yaml
+│   └── README.md
 ├── tests/
-├── scripts/install-plugin.sh
-└── examples/
+├── examples/
+│   ├── docker-compose.napcat.yml
+│   └── systemd/hermes-napcat-qq-bridge.service
+└── scripts/install-plugin.sh
 ```
+
+---
+
+## 功能
+
+- QQ 私聊 / 群聊接入 Hermes
+- 每个聊天独立 session，自动 `--resume`
+- 同一聊天串行处理；处理中收到 follow-up 会中断当前 Hermes 并合并消息
+- 支持 `/new` `/reset` `/status` `/stop` `/help`
+- 支持文本、图片、语音、视频、文件收发
+- 群文件上传 notice 会进入会话
+- 群聊默认只响应：
+  - `@机器人`
+  - 回复机器人上一条消息
+- 纯 WS 入站，默认禁用 webhook 入站
+- WS 重连后自动做一次 catch-up 补拉
+- 过滤 Hermes CLI 噪音，减少脏输出和重复段落
+
+---
 
 ## 环境要求
 
 - Linux / WSL2
-- 已安装并可正常对话的 Hermes Agent
+- 已安装并可正常运行的 Hermes Agent
 - 已登录的 NapCat
-- Python `requests`
+- Python 依赖：
+  - `requests`
+  - `websockets`（Hermes 自带 venv 已包含）
+
+---
 
 ## 安装
 
@@ -41,91 +69,85 @@
 git clone git@github.com:zhuguadundan/hermes-qq-plugin.git
 cd hermes-qq-plugin
 bash scripts/install-plugin.sh
-hermes napcat-qq-bridge --help
 ```
 
-安装后插件会被复制到：
+安装后插件会复制到：
 
 ```text
 ~/.hermes/plugins/napcat_qq_bridge
 ```
 
-## NapCat 配置
+---
 
-推荐 OneBot11 这样配：
+## 配置
 
-### HTTP Server
+先复制示例配置：
+
+```bash
+mkdir -p ~/.hermes/napcat_qq_bridge
+cp napcat_qq_bridge/config.example.json ~/.hermes/napcat_qq_bridge/config.json
+$EDITOR ~/.hermes/napcat_qq_bridge/config.json
+```
+
+核心配置：
+
+- `onebot.url`
+  - NapCat HTTP API 地址
+- `onebot.token`
+  - NapCat HTTP API token
+- `onebot.ws_url`
+  - NapCat OneBot WebSocket Server 地址
+- `onebot.ws_token`
+  - NapCat WS token
+- `bridge.receive_mode`
+  - 现在默认就是 `ws`
+
+详细字段说明见：
+
+- `napcat_qq_bridge/README.md`
+
+---
+
+## NapCat 推荐配置
+
+### 1. HTTP Server
+
+用于桥向 QQ 发消息：
 
 - Host: `127.0.0.1`
 - Port: `3000`
-- Token: 你的 OneBot token
-- `messagePostFormat`: `array`
+- Token: 你的 token
+- `messagePostFormat: array`
 
-### HTTP Client
+### 2. WebSocket Server
 
-- URL: `http://127.0.0.1:8096/napcat`
-- `messagePostFormat`: `array`
+用于 NapCat 向桥推送消息：
 
-## 启动示例
+- Host: `0.0.0.0` 或 `127.0.0.1`
+- Port: `3001`
+- Access Token: 你的 token
+
+### 3. HTTP Client
+
+**建议关闭。**
+
+纯 WS 模式下，桥会拒绝 `/napcat` webhook 入站，避免双路重复投递。
+
+---
+
+## 启动
 
 ```bash
-hermes napcat-qq-bridge run \
-  --onebot-url http://127.0.0.1:3000 \
-  --onebot-token YOUR_ONEBOT_TOKEN \
-  --listen-host 127.0.0.1 \
-  --listen-port 8096 \
-  --webhook-path /napcat \
-  --allow-user 123456789 \
-  --allow-group 987654321 \
-  --hermes-workdir /path/to/workdir \
-  --hermes-toolsets terminal,file,web \
-  -v
+hermes napcat-qq-bridge run --config-file ~/.hermes/napcat_qq_bridge/config.json
 ```
 
-默认会保留 **3 秒历史轮询兜底**。  
-如果现场 webhook 不稳定，插件仍然能继续工作。
-
-## systemd
-
-可参考：
+systemd 例子见：
 
 ```text
 examples/systemd/hermes-napcat-qq-bridge.service
 ```
 
-## 群聊触发规则
-
-默认群里只在下面两种情况回复：
-
-- `@机器人`
-- 回复机器人上一条消息
-
-如果你想群里所有消息都处理，启动时加：
-
-```bash
---group-chat-all
-```
-
-## Hermes 输出媒体
-
-如果 Hermes 要回图片、语音、视频或文件，在最终回复里输出：
-
-```text
-MEDIA:/绝对路径
-```
-
-如果音频要按 QQ 语音而不是普通文件发送，再额外带上：
-
-```text
-[[audio_as_voice]]
-```
-
-## 聊天命令
-
-- `/new` / `/reset`：重置当前聊天 session
-- `/status`：查看当前聊天状态
-- `/stop`：停止当前处理
-- `/help`：查看帮助
+---
 
 ## 健康检查
 
@@ -133,39 +155,57 @@ MEDIA:/绝对路径
 curl http://127.0.0.1:8096/healthz
 ```
 
-## 常见问题
+纯 WS 正常时，你应该看到这些关键信息：
 
-### 1. QQ 发消息没回复
+- `"receive_mode": "ws"`
+- `"webhook_ingress_enabled": false`
+- `"websocket_connected": true`
 
-先查三件事：
-
-1. NapCat HTTP Server 是否真的能访问 `127.0.0.1:3000`
-2. HTTP Client 是否真的上报到 `http://127.0.0.1:8096/napcat`
-3. 插件健康检查是否正常
-
-### 2. 群里不回复
-
-通常是因为没有 `@机器人`，也不是回复机器人消息。  
-可临时加 `--group-chat-all` 排查。
-
-### 3. 文件 / 语音偶发失败
-
-这部分有时是 NapCat 上游接口本身不稳定。  
-当前插件已经做了更多 fallback，但如果 NapCat 没返回可下载资源，桥也无法凭空恢复。
+---
 
 ## 开发与测试
 
 ```bash
-/home/dawei/.hermes/hermes-agent/venv/bin/python -m pytest -q
+cd hermes-qq-plugin
+python -m pytest -q
 ```
 
-## 当前状态
+---
 
-这份仓库已经包含以下修复：
+## 代码审查结论（本次）
 
-- 无回复回归修复（恢复轮询兜底）
-- 重复回复去重增强
-- 私聊在线文件收发支持
-- 图片 / 语音 / 文件解析路径修正
+我对插件做了一轮全面 review，主要结论是：
 
-如果你只是想直接用，按上面的安装和启动示例配置即可。
+### 已修复/已落地
+
+1. **仓库代码与线上运行版曾经不同步**
+   - 现在已经把纯 WS + 健壮性改造同步回仓库
+
+2. **README 明显落后于实际实现**
+   - 之前仍以 HTTP webhook 为主
+   - 现在已更新为纯 WS 方案
+
+3. **缺少 WS 相关测试覆盖**
+   - 现在补了：
+     - WS 配置解析
+     - WS 启动预检
+     - WS 场景下缺口恢复
+     - 新默认值校验
+
+4. **本地运行产物不该进入仓库**
+   - 已把：
+     - `napcat_qq_bridge/config.json`
+     - `napcat_qq_bridge/bridge.runtime.log`
+   - 加入忽略规则
+
+### 当前保留的设计取舍
+
+- 入站用 WS，出站仍保留 HTTP API
+  - 这是刻意保守的设计
+  - 因为发送链路已经稳定，没必要同时重构两端
+
+---
+
+## License
+
+MIT

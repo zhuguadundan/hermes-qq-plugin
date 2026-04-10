@@ -43,11 +43,15 @@ def make_cfg(bridge, tmp_path):
         values = dict(
             onebot_url="http://127.0.0.1:3000",
             onebot_token="token-123",
+            onebot_ws_url="ws://127.0.0.1:3001",
+            onebot_ws_token="token-123",
             listen_host="127.0.0.1",
             listen_port=8096,
             webhook_path="/napcat",
+            receive_mode="ws",
             allowed_user_ids=["10001"],
             allowed_group_ids=["20001"],
+            allowed_group_user_ids=[],
             allow_all=False,
             group_chat_all=False,
             hermes_bin="hermes",
@@ -63,6 +67,7 @@ def make_cfg(bridge, tmp_path):
             poll_interval=3.0,
             poll_history_count=20,
             poll_backfill_seconds=180,
+            ws_reconnect_delay=3.0,
             verbose=False,
         )
         values.update(overrides)
@@ -428,12 +433,78 @@ def test_gap_recovery_replays_missing_history_messages(bridge, make_cfg):
     assert handled == [("gap-replay", "11"), ("gap-replay", "13")]
 
 
-def test_build_arg_parser_keeps_polling_enabled_by_default(bridge, monkeypatch):
+def test_gap_recovery_also_runs_for_ws_origin(bridge, make_cfg):
+    app = bridge.BridgeApp(make_cfg())
+    source = bridge.EventSource(user_id="10001", group_id=None, message_id="current", self_id="42", raw={})
+    app._target_sequences[app.history_target_key(source)] = 10
+    handled = []
+    app.handle_event = lambda event, origin="webhook": handled.append((origin, event.get("real_seq")))
+    app.napcat.get_friend_msg_history = lambda user_id, count=20: [
+        {"post_type": "message", "message_type": "private", "user_id": "10001", "self_id": "42", "message_id": "m11", "real_seq": "11", "message": "a"},
+        {"post_type": "message", "message_type": "private", "user_id": "10001", "self_id": "42", "message_id": "m12", "real_seq": "12", "message": "b"},
+    ]
+
+    app.recover_gap_if_needed(
+        {"post_type": "message", "message_type": "private", "user_id": "10001", "self_id": "42", "message_id": "m13", "real_seq": "13", "message": "current"},
+        source,
+        origin="ws",
+    )
+
+    assert handled == [("gap-replay", "11"), ("gap-replay", "12")]
+
+
+def test_build_arg_parser_defaults_to_ws_mode_and_no_polling(bridge, monkeypatch):
     for key in list(bridge.os.environ):
         if key.startswith("NAPCAT_QQ_BRIDGE_POLL_"):
+            monkeypatch.delenv(key, raising=False)
+        if key.startswith("NAPCAT_QQ_BRIDGE_RECEIVE_MODE"):
             monkeypatch.delenv(key, raising=False)
     parser = bridge.argparse.ArgumentParser()
     bridge.build_arg_parser(parser)
     args = parser.parse_args([])
 
-    assert args.poll_interval == 3.0
+    assert args.receive_mode == "ws"
+    assert args.poll_interval == 0.0
+
+
+def test_args_to_config_reads_ws_fields_from_config_file(bridge, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        """
+        {
+          "onebot": {
+            "url": "http://127.0.0.1:3000",
+            "token": "http-token",
+            "ws_url": "ws://127.0.0.1:3001",
+            "ws_token": "ws-token"
+          },
+          "bridge": {
+            "receive_mode": "ws",
+            "ws_reconnect_delay": 5
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    parser = bridge.argparse.ArgumentParser()
+    bridge.build_arg_parser(parser)
+    args = parser.parse_args(["--config-file", str(config_path)])
+    cfg = bridge.args_to_config(args)
+
+    assert cfg.onebot_ws_url == "ws://127.0.0.1:3001"
+    assert cfg.onebot_ws_token == "ws-token"
+    assert cfg.receive_mode == "ws"
+    assert cfg.ws_reconnect_delay == 5.0
+
+
+def test_startup_check_runs_websocket_preflight_in_ws_mode(bridge, make_cfg):
+    app = bridge.BridgeApp(make_cfg(receive_mode="ws"))
+    app.napcat.get_login_info = lambda: {"user_id": "42", "nickname": "bot"}
+    called = []
+    app.websocket_preflight_check = lambda: called.append(True)
+
+    result = app.startup_check()
+
+    assert result["user_id"] == "42"
+    assert called == [True]

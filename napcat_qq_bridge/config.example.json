@@ -1,0 +1,40 @@
+{
+  "onebot": {
+    "url": "http://127.0.0.1:3000",
+    "token": "YOUR_TOKEN",
+    "ws_url": "ws://127.0.0.1:3001",
+    "ws_token": "YOUR_TOKEN"
+  },
+  "bridge": {
+    "host": "127.0.0.1",
+    "port": 8096,
+    "path": "/napcat",
+    "receive_mode": "ws",
+    "group_chat_all": false,
+    "poll_interval": 0,
+    "poll_history_count": 20,
+    "poll_backfill_seconds": 600,
+    "ws_reconnect_delay": 3,
+    "request_timeout": 60,
+    "chunk_size": 65536,
+    "temp_dir": "/home/YOUR_USER/.hermes/napcat_qq_bridge/tmp",
+    "state_dir": "/home/YOUR_USER/.hermes/napcat_qq_bridge/state"
+  },
+  "auth": {
+    "private_users": [
+      "68912345"
+    ],
+    "group_ids": [
+      "12345678"
+    ],
+    "group_users": []
+  },
+  "hermes": {
+    "bin": "hermes",
+    "workdir": "/home/YOUR_USER",
+    "model": "",
+    "provider": "",
+    "toolsets": "terminal,file,web",
+    "skills": []
+  }
+}

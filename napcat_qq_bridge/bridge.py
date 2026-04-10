@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import base64
 import copy
 import hashlib
@@ -49,11 +50,15 @@ class EventSource:
 class BridgeConfig:
     onebot_url: str
     onebot_token: str
+    onebot_ws_url: str
+    onebot_ws_token: str
     listen_host: str
     listen_port: int
     webhook_path: str
+    receive_mode: str
     allowed_user_ids: List[str]
     allowed_group_ids: List[str]
+    allowed_group_user_ids: List[str]
     allow_all: bool
     group_chat_all: bool
     hermes_bin: str
@@ -69,6 +74,7 @@ class BridgeConfig:
     poll_interval: float
     poll_history_count: int
     poll_backfill_seconds: int
+    ws_reconnect_delay: float
     verbose: bool
 
 
@@ -527,6 +533,13 @@ class BridgeApp:
         self._poll_bootstrapped_lock = threading.Lock()
         self._poll_stop = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
+        self._ws_stop = threading.Event()
+        self._ws_thread: Optional[threading.Thread] = None
+        self._ws_status_lock = threading.Lock()
+        self._ws_connected = False
+        self._ws_last_error = ""
+        self._ws_last_message_at = 0.0
+        self._ws_connect_count = 0
         self.started_at = time.time()
         Path(cfg.temp_dir).mkdir(parents=True, exist_ok=True)
 
@@ -537,6 +550,8 @@ class BridgeApp:
             raise BridgeError(self._format_startup_error(exc)) from exc
         self.bot_user_id = str(login_info.get("user_id") or "")
         self.bot_name = str(login_info.get("nickname") or self.bot_user_id or "Hermes")
+        if self.websocket_enabled():
+            self.websocket_preflight_check()
         return login_info
 
     def _format_startup_error(self, exc: Exception) -> str:
@@ -553,8 +568,52 @@ class BridgeApp:
     def log(self, message: str) -> None:
         print(f"[bridge] {message}", file=sys.stderr)
 
+    def websocket_enabled(self) -> bool:
+        return self.cfg.receive_mode in {"ws", "websocket"}
+
+    def _ws_headers(self) -> Optional[Dict[str, str]]:
+        if self.cfg.onebot_ws_token:
+            return {"Authorization": f"Bearer {self.cfg.onebot_ws_token}"}
+        return None
+
+    def websocket_preflight_check(self) -> None:
+        try:
+            asyncio.run(self._websocket_preflight_once())
+        except Exception as exc:
+            raise BridgeError(
+                f"cannot reach NapCat OneBot WebSocket at {self.cfg.onebot_ws_url}; "
+                f"detail: {exc}; check websocketServers host/port/token configuration"
+            ) from exc
+
+    async def _websocket_preflight_once(self) -> None:
+        try:
+            import websockets  # type: ignore[import-not-found]
+        except Exception as exc:
+            raise BridgeError("websocket receive mode requires the 'websockets' package in the runtime environment") from exc
+
+        async with websockets.connect(
+            self.cfg.onebot_ws_url,
+            additional_headers=self._ws_headers(),
+            open_timeout=min(self.cfg.request_timeout, 10),
+            close_timeout=2,
+            ping_interval=None,
+            max_size=2 * 1024 * 1024,
+        ) as ws:
+            try:
+                payload = await asyncio.wait_for(ws.recv(), timeout=3)
+            except asyncio.TimeoutError:
+                return
+            try:
+                event = json.loads(payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else str(payload))
+            except Exception:
+                return
+            if isinstance(event, dict) and event.get("retcode") == 1403:
+                raise BridgeError("websocket token rejected by NapCat")
+
     def auth_configured(self) -> bool:
-        return self.cfg.allow_all or bool(self.cfg.allowed_user_ids or self.cfg.allowed_group_ids)
+        return self.cfg.allow_all or bool(
+            self.cfg.allowed_user_ids or self.cfg.allowed_group_ids or self.cfg.allowed_group_user_ids
+        )
 
     def allowed(self, source: EventSource) -> bool:
         if self.cfg.allow_all:
@@ -562,9 +621,7 @@ class BridgeApp:
         if source.group_id:
             if source.group_id in self.cfg.allowed_group_ids:
                 return True
-            if source.user_id in self.cfg.allowed_user_ids:
-                return True
-            return False
+            return source.user_id in self.cfg.allowed_group_user_ids
         return source.user_id in self.cfg.allowed_user_ids
 
     def handle_event(self, event: dict, origin: str = "webhook") -> Tuple[int, dict]:
@@ -676,6 +733,8 @@ class BridgeApp:
 
     def should_process_group_event(self, event: dict, source: EventSource) -> bool:
         if not source.group_id:
+            return True
+        if event.get("notice_type") == "group_upload":
             return True
         if self.cfg.group_chat_all:
             return True
@@ -928,7 +987,7 @@ class BridgeApp:
                 self._target_sequences[target_key] = seq
 
     def recover_gap_if_needed(self, event: dict, source: EventSource, origin: str) -> None:
-        if origin != "webhook":
+        if origin not in {"webhook", "ws"}:
             return
         seq = self.event_sequence(event)
         if seq is None:
@@ -1042,6 +1101,108 @@ class BridgeApp:
             proc.wait(timeout=1.0)
         except Exception:
             pass
+
+    def start_websocket_ingress(self) -> None:
+        if not self.websocket_enabled():
+            return
+        if self._ws_thread is not None and self._ws_thread.is_alive():
+            return
+        self._ws_stop.clear()
+        self._ws_thread = threading.Thread(target=self._run_websocket_ingress, name="napcat-qq-ws", daemon=True)
+        self._ws_thread.start()
+        if self.cfg.verbose:
+            self.log(f"websocket ingress starting url={self.cfg.onebot_ws_url}")
+
+    def stop_websocket_ingress(self) -> None:
+        self._ws_stop.set()
+        thread = self._ws_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3.0)
+
+    def _run_websocket_ingress(self) -> None:
+        try:
+            asyncio.run(self._websocket_ingress_loop())
+        except Exception as exc:
+            self._set_ws_status(connected=False, error=str(exc))
+            self.log(f"websocket ingress stopped: {exc}")
+
+    async def _websocket_ingress_loop(self) -> None:
+        try:
+            import websockets  # type: ignore[import-not-found]
+        except Exception as exc:
+            raise BridgeError("websocket receive mode requires the 'websockets' package in the runtime environment") from exc
+
+        reconnect_delay = max(0.5, float(self.cfg.ws_reconnect_delay))
+        while not self._ws_stop.is_set():
+            try:
+                async with websockets.connect(
+                    self.cfg.onebot_ws_url,
+                    additional_headers=self._ws_headers(),
+                    open_timeout=self.cfg.request_timeout,
+                    close_timeout=5,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_size=10 * 1024 * 1024,
+                ) as ws:
+                    with self._ws_status_lock:
+                        self._ws_connected = True
+                        self._ws_last_error = ""
+                        self._ws_connect_count += 1
+                    if self.cfg.verbose:
+                        self.log(f"websocket ingress connected url={self.cfg.onebot_ws_url}")
+                    self._recover_after_ws_connect()
+                    while not self._ws_stop.is_set():
+                        try:
+                            payload = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            continue
+                        self._mark_ws_message()
+                        self._handle_ws_payload(payload)
+            except Exception as exc:
+                self._set_ws_status(connected=False, error=str(exc))
+                if self._ws_stop.is_set():
+                    break
+                self.log(f"websocket ingress disconnected: {exc}; retrying in {reconnect_delay:.1f}s")
+                await asyncio.sleep(reconnect_delay)
+        self._set_ws_status(connected=False, error="")
+
+    def _mark_ws_message(self) -> None:
+        with self._ws_status_lock:
+            self._ws_last_message_at = time.time()
+
+    def _set_ws_status(self, *, connected: bool, error: str) -> None:
+        with self._ws_status_lock:
+            self._ws_connected = connected
+            self._ws_last_error = error
+
+    def _recover_after_ws_connect(self) -> None:
+        try:
+            if self.cfg.poll_history_count <= 0 or self.cfg.poll_backfill_seconds <= 0:
+                return
+            self.poll_once()
+            if self.cfg.verbose:
+                self.log("websocket reconnect catch-up completed")
+        except Exception as exc:
+            self.log(f"websocket reconnect catch-up failed: {exc}")
+
+    def _handle_ws_payload(self, payload: Any) -> None:
+        raw = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else str(payload)
+        try:
+            event = json.loads(raw)
+        except Exception as exc:
+            if self.cfg.verbose:
+                self.log(f"websocket ignored invalid-json payload: {exc}")
+            return
+        if not isinstance(event, dict):
+            if self.cfg.verbose:
+                self.log(f"websocket ignored non-object payload: {type(event).__name__}")
+            return
+        if self.cfg.verbose:
+            self.log(
+                f"websocket event post_type={event.get('post_type')} message_type={event.get('message_type')} "
+                f"message_id={event.get('message_id')}"
+            )
+        self.handle_event(event, origin="ws")
 
     def start_background_polling(self) -> None:
         if self.cfg.poll_interval <= 0:
@@ -1431,17 +1592,32 @@ class BridgeApp:
         self.napcat.send_file(source, str(resolved), resolved.name)
 
     def health_payload(self) -> dict:
+        with self._ws_status_lock:
+            ws_connected = self._ws_connected
+            ws_last_error = self._ws_last_error
+            ws_last_message_at = self._ws_last_message_at
+            ws_connect_count = self._ws_connect_count
         return {
             "ok": True,
             "bot_user_id": self.bot_user_id,
             "bot_name": self.bot_name,
             "onebot_url": self.cfg.onebot_url,
+            "onebot_ws_url": self.cfg.onebot_ws_url,
+            "receive_mode": self.cfg.receive_mode,
+            "webhook_ingress_enabled": not self.websocket_enabled(),
             "transport_mode": self.napcat._transport_mode,
             "auth_configured": self.auth_configured(),
+            "allowed_private_users": len(self.cfg.allowed_user_ids),
+            "allowed_groups": len(self.cfg.allowed_group_ids),
+            "allowed_group_users": len(self.cfg.allowed_group_user_ids),
             "group_chat_all": self.cfg.group_chat_all,
             "poll_interval": self.cfg.poll_interval,
             "poll_history_count": self.cfg.poll_history_count,
             "poll_backfill_seconds": self.cfg.poll_backfill_seconds,
+            "websocket_connected": ws_connected,
+            "websocket_last_error": ws_last_error,
+            "websocket_last_message_at": ws_last_message_at,
+            "websocket_connect_count": ws_connect_count,
             "seen_events": len(self._seen_events),
         }
 
@@ -1459,6 +1635,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if urlparse(self.path).path != self.webhook_path:
             self.send_json(404, {"ok": False, "error": "not found"})
+            return
+        if self.app.websocket_enabled():
+            self.send_json(410, {"ok": False, "error": "http webhook ingress disabled in ws mode"})
             return
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(length) if length else b"{}"
@@ -1488,13 +1667,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 def build_arg_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("run", nargs="?", default="run")
+    parser.add_argument(
+        "--config-file",
+        default=os.getenv("NAPCAT_QQ_BRIDGE_CONFIG", str(_default_config_path())),
+        help="Path to JSON config file (default: ~/.hermes/napcat_qq_bridge/config.json)",
+    )
     parser.add_argument("--onebot-url", default=os.getenv("NAPCAT_ONEBOT_URL", "http://127.0.0.1:3000"))
     parser.add_argument("--onebot-token", default=os.getenv("NAPCAT_ONEBOT_TOKEN", ""))
+    parser.add_argument("--onebot-ws-url", default=os.getenv("NAPCAT_ONEBOT_WS_URL", "ws://127.0.0.1:3001"))
+    parser.add_argument("--onebot-ws-token", default=os.getenv("NAPCAT_ONEBOT_WS_TOKEN", ""))
     parser.add_argument("--listen-host", default=os.getenv("NAPCAT_QQ_BRIDGE_HOST", "127.0.0.1"))
     parser.add_argument("--listen-port", type=int, default=int(os.getenv("NAPCAT_QQ_BRIDGE_PORT", "8096")))
     parser.add_argument("--webhook-path", default=os.getenv("NAPCAT_QQ_BRIDGE_PATH", "/napcat"))
+    parser.add_argument(
+        "--receive-mode",
+        choices=("http", "ws", "websocket"),
+        default=os.getenv("NAPCAT_QQ_BRIDGE_RECEIVE_MODE", "ws"),
+        help="Inbound transport from NapCat: http webhook or websocket",
+    )
     parser.add_argument("--allow-user", action="append", default=_env_list("NAPCAT_QQ_BRIDGE_ALLOW_USERS"))
     parser.add_argument("--allow-group", action="append", default=_env_list("NAPCAT_QQ_BRIDGE_ALLOW_GROUPS"))
+    parser.add_argument("--allow-group-user", action="append", default=_env_list("NAPCAT_QQ_BRIDGE_ALLOW_GROUP_USERS"))
     parser.add_argument("--allow-all", action="store_true", default=_env_flag("NAPCAT_QQ_BRIDGE_ALLOW_ALL"))
     parser.add_argument("--group-chat-all", action="store_true", default=_env_flag("NAPCAT_QQ_BRIDGE_GROUP_CHAT_ALL"))
     parser.add_argument("--hermes-bin", default=os.getenv("HERMES_BIN", "hermes"))
@@ -1513,10 +1706,86 @@ def build_arg_parser(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--request-timeout", type=int, default=int(os.getenv("NAPCAT_QQ_BRIDGE_TIMEOUT", "60")))
     parser.add_argument("--chunk-size", type=int, default=int(os.getenv("NAPCAT_QQ_BRIDGE_CHUNK_SIZE", "65536")))
-    parser.add_argument("--poll-interval", type=float, default=float(os.getenv("NAPCAT_QQ_BRIDGE_POLL_INTERVAL", "3")))
+    parser.add_argument("--poll-interval", type=float, default=float(os.getenv("NAPCAT_QQ_BRIDGE_POLL_INTERVAL", "0")))
     parser.add_argument("--poll-history-count", type=int, default=int(os.getenv("NAPCAT_QQ_BRIDGE_POLL_HISTORY_COUNT", "20")))
     parser.add_argument("--poll-backfill-seconds", type=int, default=int(os.getenv("NAPCAT_QQ_BRIDGE_POLL_BACKFILL_SECONDS", "600")))
+    parser.add_argument("--ws-reconnect-delay", type=float, default=float(os.getenv("NAPCAT_QQ_BRIDGE_WS_RECONNECT_DELAY", "3")))
     parser.add_argument("-v", "--verbose", action="store_true")
+
+
+def _default_config_path() -> Path:
+    return Path.home() / ".hermes" / "napcat_qq_bridge" / "config.json"
+
+
+_CLI_FLAG_TO_ATTR = {
+    "--config-file": "config_file",
+    "--onebot-url": "onebot_url",
+    "--onebot-token": "onebot_token",
+    "--onebot-ws-url": "onebot_ws_url",
+    "--onebot-ws-token": "onebot_ws_token",
+    "--listen-host": "listen_host",
+    "--listen-port": "listen_port",
+    "--webhook-path": "webhook_path",
+    "--receive-mode": "receive_mode",
+    "--allow-user": "allow_user",
+    "--allow-group": "allow_group",
+    "--allow-group-user": "allow_group_user",
+    "--allow-all": "allow_all",
+    "--group-chat-all": "group_chat_all",
+    "--hermes-bin": "hermes_bin",
+    "--hermes-workdir": "hermes_workdir",
+    "--hermes-model": "hermes_model",
+    "--hermes-provider": "hermes_provider",
+    "--hermes-toolsets": "hermes_toolsets",
+    "--skill": "skills",
+    "--temp-dir": "temp_dir",
+    "--state-dir": "state_dir",
+    "--request-timeout": "request_timeout",
+    "--chunk-size": "chunk_size",
+    "--poll-interval": "poll_interval",
+    "--poll-history-count": "poll_history_count",
+    "--poll-backfill-seconds": "poll_backfill_seconds",
+    "--ws-reconnect-delay": "ws_reconnect_delay",
+    "-v": "verbose",
+    "--verbose": "verbose",
+}
+
+
+_CONFIG_VALUE_PATHS = {
+    "onebot_url": [("onebot_url",), ("onebot", "url")],
+    "onebot_token": [("onebot_token",), ("onebot", "token")],
+    "onebot_ws_url": [("onebot_ws_url",), ("onebot", "ws_url")],
+    "onebot_ws_token": [("onebot_ws_token",), ("onebot", "ws_token"), ("onebot", "token")],
+    "listen_host": [("listen_host",), ("bridge", "listen_host"), ("bridge", "host")],
+    "listen_port": [("listen_port",), ("bridge", "listen_port"), ("bridge", "port")],
+    "webhook_path": [("webhook_path",), ("bridge", "webhook_path"), ("bridge", "path")],
+    "receive_mode": [("receive_mode",), ("bridge", "receive_mode"), ("bridge", "ingress")],
+    "allow_user": [("allow_user",), ("allowed_user_ids",), ("private_users",), ("auth", "private_users")],
+    "allow_group": [("allow_group",), ("allowed_group_ids",), ("group_ids",), ("auth", "group_ids")],
+    "allow_group_user": [
+        ("allow_group_user",),
+        ("allowed_group_user_ids",),
+        ("group_users",),
+        ("auth", "group_users"),
+    ],
+    "allow_all": [("allow_all",), ("auth", "allow_all")],
+    "group_chat_all": [("group_chat_all",), ("bridge", "group_chat_all"), ("auth", "group_chat_all")],
+    "hermes_bin": [("hermes_bin",), ("hermes", "bin")],
+    "hermes_workdir": [("hermes_workdir",), ("hermes", "workdir")],
+    "hermes_model": [("hermes_model",), ("hermes", "model")],
+    "hermes_provider": [("hermes_provider",), ("hermes", "provider")],
+    "hermes_toolsets": [("hermes_toolsets",), ("hermes", "toolsets")],
+    "skills": [("skills",), ("hermes_skills",), ("hermes", "skills")],
+    "temp_dir": [("temp_dir",), ("bridge", "temp_dir")],
+    "state_dir": [("state_dir",), ("bridge", "state_dir")],
+    "request_timeout": [("request_timeout",), ("bridge", "request_timeout")],
+    "chunk_size": [("chunk_size",), ("bridge", "chunk_size")],
+    "poll_interval": [("poll_interval",), ("bridge", "poll_interval")],
+    "poll_history_count": [("poll_history_count",), ("bridge", "poll_history_count")],
+    "poll_backfill_seconds": [("poll_backfill_seconds",), ("bridge", "poll_backfill_seconds")],
+    "ws_reconnect_delay": [("ws_reconnect_delay",), ("bridge", "ws_reconnect_delay")],
+    "verbose": [("verbose",), ("bridge", "verbose")],
+}
 
 
 def _env_list(name: str) -> List[str]:
@@ -1539,36 +1808,116 @@ def _normalize_list(values: List[str]) -> List[str]:
     return out
 
 
+def _cli_override_attrs(argv: Optional[List[str]] = None) -> Set[str]:
+    seen: Set[str] = set()
+    for token in list(argv or sys.argv[1:]):
+        if token == "--":
+            break
+        if token.startswith("--"):
+            flag = token.split("=", 1)[0]
+            attr = _CLI_FLAG_TO_ATTR.get(flag)
+            if attr:
+                seen.add(attr)
+            continue
+        attr = _CLI_FLAG_TO_ATTR.get(token)
+        if attr:
+            seen.add(attr)
+    return seen
+
+
+def _load_config_data(path_value: Optional[str]) -> Dict[str, Any]:
+    if not path_value:
+        return {}
+    path = Path(path_value).expanduser()
+    default_path = _default_config_path().expanduser()
+    if not path.exists():
+        if path == default_path:
+            return {}
+        raise BridgeError(f"config file not found: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise BridgeError(f"failed to parse config file {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise BridgeError(f"config file must contain a JSON object: {path}")
+    return data
+
+
+def _config_lookup(config: Dict[str, Any], attr: str) -> Any:
+    for path in _CONFIG_VALUE_PATHS.get(attr, [(attr,) ]):
+        current: Any = config
+        found = True
+        for part in path:
+            if not isinstance(current, dict) or part not in current:
+                found = False
+                break
+            current = current[part]
+        if found:
+            return current
+    return None
+
+
+def _coerce_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items = value
+    else:
+        items = [value]
+    return _normalize_list([str(item) for item in items])
+
+
+def _pick_value(attr: str, args: argparse.Namespace, config: Dict[str, Any], cli_overrides: Set[str]) -> Any:
+    current = getattr(args, attr)
+    if attr in cli_overrides:
+        return current
+    configured = _config_lookup(config, attr)
+    if configured is None:
+        return current
+    return configured
+
+
 def args_to_config(args: argparse.Namespace) -> BridgeConfig:
+    cli_overrides = _cli_override_attrs()
+    config_data = _load_config_data(getattr(args, "config_file", None))
     return BridgeConfig(
-        onebot_url=args.onebot_url,
-        onebot_token=args.onebot_token,
-        listen_host=args.listen_host,
-        listen_port=args.listen_port,
-        webhook_path=args.webhook_path,
-        allowed_user_ids=_normalize_list(args.allow_user),
-        allowed_group_ids=_normalize_list(args.allow_group),
-        allow_all=bool(args.allow_all),
-        group_chat_all=bool(args.group_chat_all),
-        hermes_bin=args.hermes_bin,
-        hermes_workdir=args.hermes_workdir,
-        hermes_model=args.hermes_model,
-        hermes_provider=args.hermes_provider,
-        hermes_toolsets=args.hermes_toolsets,
-        hermes_skills=_normalize_list(args.skills),
-        temp_dir=args.temp_dir,
-        state_dir=args.state_dir,
-        request_timeout=args.request_timeout,
-        chunk_size=args.chunk_size,
-        poll_interval=args.poll_interval,
-        poll_history_count=args.poll_history_count,
-        poll_backfill_seconds=args.poll_backfill_seconds,
-        verbose=bool(args.verbose),
+        onebot_url=str(_pick_value("onebot_url", args, config_data, cli_overrides)),
+        onebot_token=str(_pick_value("onebot_token", args, config_data, cli_overrides)),
+        onebot_ws_url=str(_pick_value("onebot_ws_url", args, config_data, cli_overrides)),
+        onebot_ws_token=str(_pick_value("onebot_ws_token", args, config_data, cli_overrides)),
+        listen_host=str(_pick_value("listen_host", args, config_data, cli_overrides)),
+        listen_port=int(_pick_value("listen_port", args, config_data, cli_overrides)),
+        webhook_path=str(_pick_value("webhook_path", args, config_data, cli_overrides)),
+        receive_mode=str(_pick_value("receive_mode", args, config_data, cli_overrides)).lower(),
+        allowed_user_ids=_coerce_list(_pick_value("allow_user", args, config_data, cli_overrides)),
+        allowed_group_ids=_coerce_list(_pick_value("allow_group", args, config_data, cli_overrides)),
+        allowed_group_user_ids=_coerce_list(_pick_value("allow_group_user", args, config_data, cli_overrides)),
+        allow_all=bool(_pick_value("allow_all", args, config_data, cli_overrides)),
+        group_chat_all=bool(_pick_value("group_chat_all", args, config_data, cli_overrides)),
+        hermes_bin=str(_pick_value("hermes_bin", args, config_data, cli_overrides)),
+        hermes_workdir=str(_pick_value("hermes_workdir", args, config_data, cli_overrides)),
+        hermes_model=str(_pick_value("hermes_model", args, config_data, cli_overrides)),
+        hermes_provider=str(_pick_value("hermes_provider", args, config_data, cli_overrides)),
+        hermes_toolsets=str(_pick_value("hermes_toolsets", args, config_data, cli_overrides)),
+        hermes_skills=_coerce_list(_pick_value("skills", args, config_data, cli_overrides)),
+        temp_dir=str(_pick_value("temp_dir", args, config_data, cli_overrides)),
+        state_dir=str(_pick_value("state_dir", args, config_data, cli_overrides)),
+        request_timeout=int(_pick_value("request_timeout", args, config_data, cli_overrides)),
+        chunk_size=int(_pick_value("chunk_size", args, config_data, cli_overrides)),
+        poll_interval=float(_pick_value("poll_interval", args, config_data, cli_overrides)),
+        poll_history_count=int(_pick_value("poll_history_count", args, config_data, cli_overrides)),
+        poll_backfill_seconds=int(_pick_value("poll_backfill_seconds", args, config_data, cli_overrides)),
+        ws_reconnect_delay=float(_pick_value("ws_reconnect_delay", args, config_data, cli_overrides)),
+        verbose=bool(_pick_value("verbose", args, config_data, cli_overrides)),
     )
 
 
 def main(args: argparse.Namespace) -> int:
-    cfg = args_to_config(args)
+    try:
+        cfg = args_to_config(args)
+    except Exception as exc:
+        print(f"NapCat QQ bridge config error: {exc}", file=sys.stderr)
+        return 1
     app = BridgeApp(cfg)
     try:
         login_info = app.startup_check()
@@ -1578,7 +1927,7 @@ def main(args: argparse.Namespace) -> int:
     if not app.auth_configured():
         print(
             "Warning: no allowlist configured and --allow-all not set. "
-            "All inbound chats will be denied until you add --allow-user / --allow-group or --allow-all.",
+            "All inbound chats will be denied until you add --allow-user / --allow-group / --allow-group-user or --allow-all.",
             file=sys.stderr,
         )
     WebhookHandler.app = app
@@ -1587,13 +1936,18 @@ def main(args: argparse.Namespace) -> int:
     print(f"NapCat QQ bridge listening on http://{cfg.listen_host}:{cfg.listen_port}{cfg.webhook_path}")
     print(f"Health check: http://{cfg.listen_host}:{cfg.listen_port}/healthz")
     print(f"OneBot API: {cfg.onebot_url}")
+    print(f"Receive mode: {cfg.receive_mode}")
+    if app.websocket_enabled():
+        print(f"OneBot WebSocket: {cfg.onebot_ws_url}")
     print(f"Bot self_id: {login_info.get('user_id')} ({login_info.get('nickname') or 'unknown'})")
+    app.start_websocket_ingress()
     app.start_background_polling()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
+        app.stop_websocket_ingress()
         app.stop_background_polling()
         server.server_close()
     return 0
