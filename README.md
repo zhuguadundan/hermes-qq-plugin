@@ -1,60 +1,73 @@
 # Hermes QQ Plugin
 
-一个把 NapCat（个人 QQ / NTQQ）接到 Hermes 的 QQ 桥接插件。
+这是一个把 NapCat（个人 QQ / NTQQ）接到 Hermes 的 QQ 桥接插件。
 
-适合这种场景：
-- 你已经在本机跑着 Hermes Agent
-- 你已经用 NapCat 登录了自己的 QQ
-- 你希望通过 QQ 私聊或 QQ 群直接和 Hermes 说话
+它适合这样的场景：
+- 你已经能在本机正常运行 Hermes Agent
+- 你已经让 NapCat 登录了自己的 QQ
+- 你希望通过 QQ 私聊或 QQ 群直接和 Hermes 对话
 
-当前桥接实现：
+当前实现特点：
 - 入站：NapCat OneBot WebSocket Server（纯 WS）
 - 出站：NapCat OneBot HTTP API
 - 每个聊天独立 Hermes session，自动恢复 `--resume`
-- 同聊天串行处理；处理中收到 follow-up 会中断并合并
-- 支持文本、图片、语音、视频、文件
+- 同一聊天串行处理；处理中收到 follow-up 会中断并合并
+- 支持文本、图片、语音、视频、普通文件
 - 支持 `/new` `/reset` `/status` `/stop` `/help`
-- 支持群文件上传 notice、离线文件、在线文件（NapCat 扩展能力）
-- 回复优先走 Hermes 结构化最终结果，不再依赖 CLI stdout 抓正文
+- 支持群文件上传 notice、离线文件、在线文件（NapCat 扩展）
+- 回复优先走 Hermes 结构化最终结果，不依赖 CLI stdout 抓正文
 
 ---
 
-## 1. 先分清三个位置
+## 1. 目录说明
 
-这个仓库会涉及 3 个位置，但它们含义不同：
+这个插件涉及 3 个不同位置，先分清：
 
-1. GitHub 源码仓库
-   - 你 clone 下来的项目目录
-   - 例如：`~/hermes-qq-plugin`
-   - 这里只是源码，不会被 Hermes 自动加载
+### 1.1 GitHub 源码仓库
+就是你 clone 下来的仓库目录，例如：
 
-2. 插件安装目录
-   - `~/.hermes/plugins/napcat_qq_bridge`
-   - 这里是 Hermes 实际加载的插件代码
-   - `scripts/install-plugin.sh` 就是把源码复制到这里
+```text
+~/hermes-qq-plugin
+```
 
-3. 插件运行目录
-   - `~/.hermes/napcat_qq_bridge`
-   - 这里放运行配置和状态：
-     - `config.json`
-     - `tmp/`
-     - `state/`
+这里只是源码，不会被 Hermes 自动加载。
 
-记住就行：
-- 源码看仓库
-- Hermes 实际加载代码看 `~/.hermes/plugins/napcat_qq_bridge`
-- 配置和状态看 `~/.hermes/napcat_qq_bridge`
+### 1.2 插件安装目录
+Hermes 实际加载的插件代码目录：
+
+```text
+~/.hermes/plugins/napcat_qq_bridge
+```
+
+`scripts/install-plugin.sh` 会把仓库里的 `napcat_qq_bridge/` 复制到这里。
+
+### 1.3 插件运行目录
+运行配置、缓存、状态目录：
+
+```text
+~/.hermes/napcat_qq_bridge
+```
+
+这里通常会有：
+- `config.json`
+- `tmp/`
+- `state/`
+
+记忆方法：
+- 仓库目录 = 源码
+- `~/.hermes/plugins/...` = Hermes 加载的插件代码
+- `~/.hermes/napcat_qq_bridge/...` = 配置和运行数据
 
 ---
 
-## 2. 整体架构
+## 2. 架构
 
 ```text
 QQ 用户 / QQ 群
    ↓
 NapCat（登录你的 QQ）
    ↓  OneBot WebSocket Server
-Hermes QQ Bridge（本仓库）
+Hermes QQ Bridge（本插件）
    ↓  Hermes CLI / Hermes Agent
 Hermes
    ↓  OneBot HTTP API
@@ -65,112 +78,93 @@ QQ 用户 / QQ 群
 
 职责分工：
 - NapCat：负责和 QQ 通讯
-- 本插件：负责把 QQ 消息变成 Hermes 会话请求
-- Hermes：负责理解、工具调用、生成回复
+- 本插件：负责把 QQ 消息转成 Hermes 会话请求
+- Hermes：负责理解、调用工具、生成回复
 
 ---
 
-## 3. 私聊和群聊怎么接通
-
-### 私聊
-
-当你把某个 QQ 号加入白名单后：
-- 这个 QQ 号私聊机器人账号
-- 桥会把该私聊映射成一个独立 Hermes session
-- 之后同一私聊会自动复用这个 session
-
-结果就是：
-- 私聊 A 和私聊 B 不会串上下文
-- 重启桥后，只要 session 还在，就会继续 `--resume`
-
-### 群聊
-
-群聊有两层控制：
-1. 群号是否允许
-2. 群里什么消息会触发
-
-默认推荐行为：
-- 只有这两种消息会触发机器人：
-  - `@机器人`
-  - 回复机器人上一条消息
-
-如果你想让机器人在群里看见所有消息都回复：
-- 设 `group_chat_all=true`
-
-群聊 session 行为：
-- 默认按“群 + 发言用户”隔离
-- 同一个群里，不同人通常是不同上下文
-
----
-
-## 4. 环境要求
+## 3. 环境要求
 
 必须满足：
-1. Linux / WSL2 / 能稳定跑 Hermes 的环境
+
+1. Linux / WSL2 / 其他能稳定运行 Hermes 的环境
 2. 已安装 Hermes Agent
 3. 已安装并登录 NapCat
-4. Python 依赖：
+4. Python 依赖可用：
    - `requests`
    - `websockets`
 
-如果你是用 Hermes 自带 venv 跑，通常已经有这些依赖。
+如果你是使用 Hermes 自带 venv 启动，一般这些依赖已经具备。
 
 ---
 
-## 5. 安装
+## 4. 安装步骤
+
+### 4.1 克隆仓库
 
 ```bash
 git clone git@github.com:zhuguadundan/hermes-qq-plugin.git
 cd hermes-qq-plugin
+```
+
+### 4.2 安装插件到 Hermes
+
+```bash
 bash scripts/install-plugin.sh
 ```
 
-安装完成后：
-- 插件代码会被复制到：
-  - `~/.hermes/plugins/napcat_qq_bridge`
-- 运行配置仍然放在：
-  - `~/.hermes/napcat_qq_bridge/config.json`
+安装完成后，插件代码会进入：
 
-你可以这样确认插件命令已注册：
+```text
+~/.hermes/plugins/napcat_qq_bridge
+```
+
+### 4.3 确认 Hermes 能看到插件
 
 ```bash
 hermes napcat-qq-bridge --help
 ```
 
+如果这条命令能正常输出帮助，说明插件已被 Hermes 正确加载。
+
 ---
 
-## 6. 先配 NapCat
+## 5. 先配置 NapCat
 
-你至少要开两个服务。
+你至少要打开两个服务。
 
-### 6.1 HTTP Server
+### 5.1 HTTP Server
+
 给桥发消息用。
 
-推荐：
+推荐配置：
 - Host: `127.0.0.1`
 - Port: `3000`
 - Token: 你自己的 token
 - `messagePostFormat: array`
 
-### 6.2 WebSocket Server
+### 5.2 WebSocket Server
+
 给桥推消息用。
 
-推荐：
+推荐配置：
 - Host: `127.0.0.1` 或 `0.0.0.0`
 - Port: `3001`
-- Access Token: 和 HTTP token 保持一致更省事
+- Access Token: 建议和 HTTP token 保持一致
 
-### 6.3 HTTP Client
+### 5.3 HTTP Client
+
 建议关闭。
 
-因为当前桥主方案是纯 WS 入站。
-如果你同时开 HTTP Client webhook，容易双路重复投递。
+原因：
+- 当前桥主方案是纯 WS 入站
+- 如果同时打开 HTTP Client webhook，容易双路重复投递
 
 ---
 
-## 7. 配置桥
+## 6. 配置桥
 
-先复制示例配置：
+### 6.1 准备配置文件
 
 ```bash
 mkdir -p ~/.hermes/napcat_qq_bridge
@@ -178,7 +172,7 @@ cp napcat_qq_bridge/config.example.json ~/.hermes/napcat_qq_bridge/config.json
 $EDITOR ~/.hermes/napcat_qq_bridge/config.json
 ```
 
-### 7.1 一个可直接参考的配置
+### 6.2 示例配置
 
 ```json
 {
@@ -219,11 +213,11 @@ $EDITOR ~/.hermes/napcat_qq_bridge/config.json
 }
 ```
 
-### 7.2 关键字段解释
+### 6.3 关键字段解释
 
 #### `onebot.url`
 NapCat HTTP API 地址。
-桥给 QQ 发消息时会用它。
+桥给 QQ 发消息时会使用它。
 
 #### `onebot.ws_url`
 NapCat WebSocket Server 地址。
@@ -232,19 +226,13 @@ NapCat WebSocket Server 地址。
 #### `auth.private_users`
 允许触发机器人的私聊 QQ 号列表。
 
-如果你只想允许自己私聊控制 Hermes，就只填你自己的 QQ 号。
-
 #### `auth.group_ids`
 允许机器人工作的群号列表。
 
-群不在这里，就算有人 @ 它也不会处理。
-
 #### `auth.group_users`
-可选的“群成员白名单”。
+可选群成员白名单。
 
-含义是：
-- 只允许这些用户在群里触发机器人
-- 适合把群开放给少数几个人用
+如果不为空，则只有这些成员可以在群里触发机器人。
 
 #### `bridge.group_chat_all`
 是否让群里所有消息都触发。
@@ -255,15 +243,34 @@ NapCat WebSocket Server 地址。
 - `@机器人`
 - 回复机器人上一条消息
 
-如果你设成 `true`：
+如果设成 `true`：
 - 群里所有消息都可能触发
-- 容易刷屏，不建议大群使用
+- 容易刷屏，不建议默认开启
+
+#### `bridge.poll_interval`
+轮询兜底间隔。
+
+主通道仍然是 WebSocket。
+如果你非常依赖纯 WS，可以保持 `0`。
+
+#### `hermes.toolsets`
+传给 Hermes 的 toolsets。
+
+例如：
+- `terminal,file,web`
+
+#### `hermes.skills`
+预加载 skills。
+
+例如：
+- `obsidian-schedule`
+- `podcast-transcript`
 
 ---
 
-## 8. 怎么让私聊能用
+## 7. 私聊怎么接通
 
-最简单做法：
+最简单的方式：
 
 ```json
 "auth": {
@@ -273,13 +280,16 @@ NapCat WebSocket Server 地址。
 }
 ```
 
-这样就只有你私聊时能触发。
+这样：
+- 只有这个 QQ 号私聊机器人时能触发
+- 会形成一个独立 Hermes session
+- 同一私聊会自动复用 session
 
 ---
 
-## 9. 怎么让群里能用
+## 8. 群聊怎么接通
 
-### 推荐做法：只在指定群里，且只响应 @ 或 reply
+### 推荐做法：指定群 + 只响应 @ / reply
 
 ```json
 "auth": {
@@ -306,7 +316,7 @@ NapCat WebSocket Server 地址。
 }
 ```
 
-### 如果你真想让群里所有消息都触发
+### 如果你想让群里所有消息都触发
 
 ```json
 "bridge": {
@@ -318,9 +328,9 @@ NapCat WebSocket Server 地址。
 
 ---
 
-## 10. 启动
+## 9. 启动方式
 
-### 直接启动
+### 9.1 直接启动
 
 ```bash
 hermes napcat-qq-bridge run --config-file ~/.hermes/napcat_qq_bridge/config.json
@@ -333,14 +343,20 @@ hermes napcat-qq-bridge run
 ```
 
 默认会读取：
-- `~/.hermes/napcat_qq_bridge/config.json`
 
-### systemd 启动
+```text
+~/.hermes/napcat_qq_bridge/config.json
+```
 
-参考：
-- `examples/systemd/hermes-napcat-qq-bridge.service`
+### 9.2 systemd 启动
 
-启用示例：
+仓库里有示例：
+
+```text
+examples/systemd/hermes-napcat-qq-bridge.service
+```
+
+启用方式：
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -352,7 +368,7 @@ systemctl --user enable --now hermes-napcat-qq-bridge.service
 
 ---
 
-## 11. 健康检查
+## 10. 健康检查
 
 ```bash
 curl http://127.0.0.1:8096/healthz
@@ -374,7 +390,7 @@ curl http://127.0.0.1:8096/healthz
 
 ---
 
-## 12. 聊天命令
+## 11. 聊天命令
 
 支持：
 - `/new` / `/reset`
@@ -382,9 +398,15 @@ curl http://127.0.0.1:8096/healthz
 - `/stop`
 - `/help`
 
+作用：
+- `/new` / `/reset`：重置当前聊天 session
+- `/status`：查看当前聊天状态和 session
+- `/stop`：停止当前处理
+- `/help`：返回命令说明
+
 ---
 
-## 13. Hermes 回媒体的规则
+## 12. 媒体回复规则
 
 如果 Hermes 想给 QQ 发本地文件，需要这样返回：
 
@@ -401,7 +423,7 @@ MEDIA:/absolute/path/to/file
 MEDIA:/absolute/path/to/audio.ogg
 ```
 
-桥会自动根据扩展名分发：
+桥会按扩展名自动分发：
 - 图片 -> 图片消息
 - 音频 -> 语音或文件
 - 视频 -> 视频消息
@@ -409,23 +431,26 @@ MEDIA:/absolute/path/to/audio.ogg
 
 ---
 
-## 14. 常见排错
+## 13. 常见排错
 
-### 私聊没回复
+### 13.1 私聊没回复
+
 检查：
 1. 你的 QQ 号是否在 `auth.private_users`
 2. NapCat 是否真的登录成功
 3. `healthz` 里 `websocket_connected` 是否为 `true`
 
-### 群里没回复
+### 13.2 群里没回复
+
 检查：
 1. 群号是否在 `auth.group_ids`
 2. 是否确实 `@机器人` 或回复机器人消息
 3. 是否配了 `group_users`，导致你不在允许名单里
 4. 如要排查，可暂时设 `group_chat_all=true`
 
-### 桥启动失败
-测试 NapCat HTTP API：
+### 13.3 桥启动失败
+
+先测 NapCat HTTP API：
 
 ```bash
 curl -X POST \
@@ -435,20 +460,47 @@ curl -X POST \
   -d '{}'
 ```
 
-### 图片/文件/语音收不到
+### 13.4 图片 / 文件 / 语音收不到
+
 检查：
 1. NapCat 版本是否支持相关接口
 2. NapCat token 是否正确
 3. HTTP API 是否可访问
 4. 文件资源是否已经过期
 
+### 13.5 WebSocket 偶尔断开
+
+当前桥会自动重连，并在重连后做一次历史补拉。
+如果现场网络经常抖：
+- 保持 `ws_reconnect_delay` 合理
+- 不要同时开 HTTP Client webhook 双路投递
+
 ---
 
-## 15. 测试
+## 14. 测试
 
 ```bash
 cd hermes-qq-plugin
 /home/dawei/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_napcat_qq_bridge.py -q
+```
+
+---
+
+## 15. 仓库结构
+
+```text
+.
+├── napcat_qq_bridge/
+│   ├── bridge.py
+│   ├── cli.py
+│   ├── config.example.json
+│   ├── README.md
+│   └── plugin.yaml
+├── tests/
+├── examples/
+│   ├── docker-compose.napcat.yml
+│   └── systemd/hermes-napcat-qq-bridge.service
+└── scripts/install-plugin.sh
 ```
 
 ---

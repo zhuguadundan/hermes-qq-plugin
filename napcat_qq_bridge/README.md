@@ -2,11 +2,11 @@
 
 NapCat / OneBot 到 Hermes 的 QQ 桥接组件。
 
-如果你只关心“怎么装、怎么接私聊/群聊、怎么配”，优先看仓库根目录 `README.md`。
+如果你只关心“怎么安装、怎么配私聊和群聊、怎么启动”，优先看仓库根目录 `README.md`。
 
-这里补充组件级要点。
+这个文件提供组件级补充说明。
 
-## 默认路径
+## 1. 默认路径
 
 - 插件安装目录：
   - `~/.hermes/plugins/napcat_qq_bridge`
@@ -17,7 +17,7 @@ NapCat / OneBot 到 Hermes 的 QQ 桥接组件。
 - 状态目录：
   - `~/.hermes/napcat_qq_bridge/state`
 
-## 组件职责
+## 2. 组件职责
 
 - 连接 NapCat OneBot WebSocket Server 收消息
 - 调用 Hermes CLI 处理消息
@@ -26,7 +26,7 @@ NapCat / OneBot 到 Hermes 的 QQ 桥接组件。
 - 处理中收到 follow-up 时中断并合并
 - 回复优先取 Hermes 的结构化最终结果，不再依赖 CLI stdout 抓正文
 
-## 修复后的行为
+## 3. 当前行为
 
 - 同一个 QQ 私聊或群聊会绑定固定 Hermes session，自动 `--resume`
 - 群聊 session 默认按“群 + 发言人”隔离
@@ -41,21 +41,8 @@ NapCat / OneBot 到 Hermes 的 QQ 桥接组件。
 - 图片优先尝试 `get_image` 刷新 URL
 - 语音优先走 `get_record`
 - 文件上传走 NapCat Stream API 分片格式
-- 会过滤 Hermes CLI 的噪音和重复段落作为兜底保护
 
-## 触发规则
-
-私聊：
-- 用户 QQ 号必须在 `private_users`
-
-群聊：
-- 群号必须在 `group_ids`
-- 默认只响应：
-  - `@机器人`
-  - 回复机器人上一条消息
-- 如果 `group_chat_all=true`，群里所有消息都可能触发
-
-## 关键配置
+## 4. 关键配置
 
 ### onebot
 - `url`: HTTP API 地址
@@ -70,6 +57,8 @@ NapCat / OneBot 到 Hermes 的 QQ 桥接组件。
 - `poll_history_count`: 历史补拉条数
 - `poll_backfill_seconds`: 历史补拉时间窗口
 - `ws_reconnect_delay`: WS 断开后重连间隔
+- `request_timeout`: HTTP 请求超时
+- `chunk_size`: Stream API 上传分片大小
 
 ### auth
 - `private_users`: 私聊白名单
@@ -84,21 +73,23 @@ NapCat / OneBot 到 Hermes 的 QQ 桥接组件。
 - `toolsets`: 预加载工具集
 - `skills`: 预加载 skills
 
-## 健康检查
+## 5. 健康检查
 
 ```bash
 curl http://127.0.0.1:8096/healthz
 ```
 
-关注：
+重点关注：
 - `websocket_connected`
 - `websocket_last_error`
 - `receive_mode`
 - `seen_events`
+- `bot_user_id`
+- `bot_name`
 
-## 媒体回发规则
+## 6. Hermes 媒体回发规则
 
-Hermes 最终回复里：
+Hermes 最终回复中：
 
 ```text
 MEDIA:/absolute/path/to/file
@@ -111,8 +102,9 @@ MEDIA:/absolute/path/to/file
 MEDIA:/absolute/path/to/audio.ogg
 ```
 
-## 常见命令
+## 7. 命令
 
+支持：
 - `/new`
 - `/reset`
 - `/status`
