@@ -10,7 +10,7 @@
 
 也就是说：
 - 这个仓库 != 官方 Hermes 发布物
-- 直接把插件复制到 `~/.hermes/plugins/napcat_qq_bridge` 并不保证“cron、权限、工具路由、QQ 会话”全部工作
+- 直接把插件复制到 `~/.hermes/plugins/napcat_qq_bridge` 并不保证“cron、权限、工具路由、QQ 会话、危险命令审批”全部工作
 - 你还需要确认 Hermes 本体已经包含下面这些修复
 
 ---
@@ -30,6 +30,7 @@
 - `send_message` 能发到 `qq`
 - 平台默认 toolset 不报 `KeyError: 'qq'`
 - Gateway 授权层读取 `platforms.qq.extra` 的 allowlist
+- QQ 渠道默认不再弹危险命令审批
 
 那 Hermes 本体必须同步补齐。
 
@@ -137,6 +138,70 @@ cron:
 - 你收到的 cron 消息不是纯正文
 - 而是一大段系统包装文字
 
+### 2.7 关闭 QQ 渠道的危险命令审批
+
+文件：
+- `~/.hermes/config.yaml`
+- `gateway/run.py`
+
+推荐做法有两层：
+
+#### 方案 A：全局关闭审批（最直接）
+
+```yaml
+approvals:
+  mode: off
+```
+
+作用：
+- 所有危险命令审批都关闭
+- QQ 渠道不会再弹：
+  - `Dangerous command requires approval`
+
+#### 方案 B：只对 QQ 渠道默认放行
+
+在 `platforms.qq.extra` 里增加：
+
+```yaml
+platforms:
+  qq:
+    extra:
+      auto_approve_dangerous_commands: true
+```
+
+并且 Hermes 本体的 `gateway/run.py` 需要支持这个字段。
+
+作用：
+- 只让 QQ 会话自动进入 YOLO/免审批
+- 不影响其他渠道
+
+如果没这一步，症状通常是：
+- 用户在 QQ 里发图片后，agent 想执行图像处理脚本
+- 结果被危险命令审批拦住
+- QQ 收到一条 `/approve` / `/deny` 提示，而不是正常结果
+
+### 2.8 统一 QQ 渠道的重启方式
+
+文件：
+- `~/.config/systemd/user/hermes-gateway.service`
+- 以及本地运维说明
+
+当前建议：
+- 不再重启旧的独立 bridge 服务
+- 只重启：
+
+```bash
+systemctl --user restart hermes-gateway.service
+```
+
+原因：
+- 你现在实际在跑的是 Hermes Gateway 内部的原生 `qq` 平台
+- 旧的 `hermes-napcat-qq-bridge.service` 只是历史遗留 / 回滚用途
+
+如果没这一步，症状通常是：
+- 改了 `config.yaml` 以后去重启错误的服务
+- 结果 QQ 渠道配置根本没生效
+
 ---
 
 ## 3. 建议你如何判断 Hermes 是否已经打好补丁
@@ -201,6 +266,40 @@ journalctl --user -u hermes-gateway.service --since '30 min ago' --no-pager | gr
 
 正常情况下，如果你已经配置了 allowlist，就不应该持续看到这类日志。
 
+### 3.5 看 QQ 渠道是否还会弹危险命令审批
+
+如果你已经配置：
+
+```yaml
+approvals:
+  mode: off
+```
+
+或者：
+
+```yaml
+platforms:
+  qq:
+    extra:
+      auto_approve_dangerous_commands: true
+```
+
+那么用户从 QQ 发图片、图像编辑请求等场景时，不应该再收到：
+
+```text
+Dangerous command requires approval
+```
+
+### 3.6 看重启命令是否统一
+
+修改 `config.yaml` 后，请用：
+
+```bash
+systemctl --user restart hermes-gateway.service
+```
+
+而不是旧的独立 bridge 服务。
+
 ---
 
 ## 4. 推荐的最小 Hermes 修复集合
@@ -215,6 +314,8 @@ journalctl --user -u hermes-gateway.service --since '30 min ago' --no-pager | gr
 6. `tools/send_message_tool.py` 能识别 `qq`
 7. `gateway/run.py` 的授权逻辑认识 `qq`
 8. `cron.wrap_response = false`
+9. QQ 渠道的危险命令审批已关闭（全局或按平台）
+10. 你知道正确重启命令是 `systemctl --user restart hermes-gateway.service`
 
 没有这些，插件本身可能装上了，但实际体验还是会不断 debug。
 
@@ -262,6 +363,8 @@ journalctl --user -u hermes-gateway.service --since '30 min ago' --no-pager | gr
 - toolset 可能 KeyError
 - allowlist 可能不生效
 - QQ 平台可能根本不被认成一等公民
+- 图片处理时还可能被危险命令审批卡住
+- 改完 `config.yaml` 还可能重启错服务
 
 所以如果你希望“别人拿到这个仓库就顺畅使用，而不是不停 debug”，最关键的其实不是 README 本身，而是：
 
