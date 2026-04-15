@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -300,52 +301,224 @@ class NapCatClient:
         raise BridgeError(f"upload_file_stream completion missing file_path: {done}")
 
 
+class HermesStructuredInvocation:
+    def __init__(self, cfg: BridgeConfig, prompt: str, session_id: Optional[str]):
+        self.cfg = cfg
+        self.prompt = prompt
+        self.session_id = session_id
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="hermes-structured-runner", daemon=True)
+        self._agent = None
+        self._interrupt_requested = False
+        self._interrupt_message: Optional[str] = None
+        self.result: Dict[str, Any] = {}
+        self.returncode: Optional[int] = None
+
+    def start(self) -> "HermesStructuredInvocation":
+        self._thread.start()
+        return self
+
+    def poll(self) -> Optional[int]:
+        return None if self._thread.is_alive() else (self.returncode if self.returncode is not None else 0)
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            raise subprocess.TimeoutExpired("hermes-structured-runner", timeout)
+        return self.returncode if self.returncode is not None else 0
+
+    def terminate(self) -> None:
+        self._request_interrupt("Interrupted by follow-up QQ message")
+
+    def kill(self) -> None:
+        self._request_interrupt("Interrupted by follow-up QQ message")
+
+    def _request_interrupt(self, message: str) -> None:
+        agent = None
+        with self._lock:
+            self._interrupt_requested = True
+            self._interrupt_message = message
+            agent = self._agent
+        if agent is not None:
+            try:
+                agent.interrupt(message)
+            except Exception:
+                pass
+
+    def _bind_agent(self, agent: Any) -> None:
+        interrupt_message: Optional[str] = None
+        with self._lock:
+            self._agent = agent
+            if self._interrupt_requested:
+                interrupt_message = self._interrupt_message or "Interrupted by follow-up QQ message"
+        if interrupt_message:
+            try:
+                agent.interrupt(interrupt_message)
+            except Exception:
+                pass
+
+    def _set_result(self, **payload: Any) -> None:
+        self.result = payload
+        self.returncode = 0 if not payload.get("error") else 1
+        self._done.set()
+
+    def _run(self) -> None:
+        try:
+            payload = _run_hermes_structured(self.cfg, self.prompt, self.session_id, self)
+        except Exception as exc:
+            payload = {
+                "response": "",
+                "session_id": self.session_id,
+                "error": f"{type(exc).__name__}: {exc}",
+                "missing_session": any(marker in str(exc) for marker in SESSION_NOT_FOUND_MARKERS),
+                "interrupted": isinstance(exc, InterruptedError),
+            }
+        self._set_result(**payload)
+
+
+def _resolve_hermes_project_root(cfg: BridgeConfig) -> Path:
+    candidates: List[Path] = []
+
+    python_path = Path(sys.executable).resolve()
+    if len(python_path.parents) >= 3:
+        candidates.append(python_path.parents[2])
+
+    hermes_bin = shutil.which(cfg.hermes_bin) if cfg.hermes_bin else None
+    if hermes_bin:
+        hermes_path = Path(hermes_bin).resolve()
+        if len(hermes_path.parents) >= 3:
+            candidates.append(hermes_path.parents[2])
+        if len(hermes_path.parents) >= 2:
+            candidates.append(hermes_path.parents[1])
+
+    for candidate in candidates:
+        if (candidate / "cli.py").exists() and (candidate / "hermes_cli").is_dir():
+            return candidate
+    raise BridgeError(
+        f"cannot resolve Hermes project root for structured runner (hermes_bin={cfg.hermes_bin!r}, python={sys.executable!r})"
+    )
+
+
+def _parse_toolsets(raw: str) -> Optional[List[str]]:
+    if not raw:
+        return None
+    toolsets = [part.strip() for part in str(raw).split(",") if part.strip()]
+    return toolsets or None
+
+
+def _run_hermes_structured(
+    cfg: BridgeConfig,
+    prompt: str,
+    session_id: Optional[str],
+    invocation: HermesStructuredInvocation,
+) -> Dict[str, Any]:
+    project_root = _resolve_hermes_project_root(cfg)
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+    from agent.skill_commands import build_preloaded_skills_prompt
+    from cli import HermesCLI
+
+    os.environ["HERMES_SESSION_SOURCE"] = "tool"
+
+    cli = HermesCLI(
+        model=cfg.hermes_model or None,
+        toolsets=_parse_toolsets(cfg.hermes_toolsets),
+        provider=cfg.hermes_provider or None,
+        verbose=False,
+        compact=True,
+        resume=session_id,
+    )
+    cli.tool_progress_mode = "off"
+    cli.streaming_enabled = False
+
+    if cfg.hermes_skills:
+        skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
+            cfg.hermes_skills,
+            task_id=cli.session_id,
+        )
+        if missing_skills:
+            raise BridgeError(f"Unknown skill(s): {', '.join(missing_skills)}")
+        if skills_prompt:
+            cli.system_prompt = "\n\n".join(part for part in (cli.system_prompt, skills_prompt) if part).strip()
+            cli.preloaded_skills = loaded_skills
+
+    if session_id and cli._session_db and not cli._session_db.get_session(session_id):
+        return {
+            "response": "",
+            "session_id": session_id,
+            "error": f"Session not found: {session_id}",
+            "missing_session": True,
+            "interrupted": False,
+        }
+
+    if not cli._ensure_runtime_credentials():
+        raise BridgeError("Hermes runtime credentials not available")
+
+    turn_route = cli._resolve_turn_agent_config(prompt)
+    if turn_route["signature"] != cli._active_agent_route_signature:
+        cli.agent = None
+    if not cli._init_agent(
+        model_override=turn_route["model"],
+        runtime_override=turn_route["runtime"],
+        route_label=turn_route["label"],
+    ):
+        raise BridgeError("Failed to initialize Hermes agent")
+
+    agent = cli.agent
+    if agent is None:
+        raise BridgeError("Agent initialization succeeded without creating an agent")
+
+    agent.quiet_mode = True
+    agent.verbose_logging = False
+    agent.stream_delta_callback = None
+    agent.tool_progress_callback = None
+    agent.tool_start_callback = None
+    agent.tool_complete_callback = None
+    agent.reasoning_callback = None
+    agent.thinking_callback = None
+    if hasattr(agent, "tool_gen_callback"):
+        agent.tool_gen_callback = None
+    if hasattr(agent, "_print_fn"):
+        agent._print_fn = lambda *args, **kwargs: None
+
+    invocation._bind_agent(agent)
+
+    result = agent.run_conversation(
+        user_message=prompt,
+        conversation_history=cli.conversation_history,
+    )
+    interrupted = bool(result.get("interrupted")) if isinstance(result, dict) else False
+    if interrupted:
+        raise InterruptedError(result.get("final_response") if isinstance(result, dict) else "Hermes interrupted")
+    response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+    return {
+        "response": response,
+        "session_id": cli.session_id,
+        "error": None,
+        "missing_session": False,
+        "interrupted": False,
+    }
+
+
 class HermesRunner:
     def __init__(self, cfg: BridgeConfig):
         self.cfg = cfg
 
-    def start(self, prompt: str, session_id: Optional[str] = None) -> subprocess.Popen:
-        cmd = [self.cfg.hermes_bin, "chat", "-q", prompt, "--quiet", "--source", "tool"]
-        if session_id:
-            cmd += ["--resume", session_id]
-        if self.cfg.hermes_toolsets:
-            cmd += ["-t", self.cfg.hermes_toolsets]
-        if self.cfg.hermes_model:
-            cmd += ["-m", self.cfg.hermes_model]
-        if self.cfg.hermes_provider:
-            cmd += ["--provider", self.cfg.hermes_provider]
-        for skill in self.cfg.hermes_skills:
-            cmd += ["-s", skill]
-        env = os.environ.copy()
-        env.setdefault("PYTHONIOENCODING", "utf-8")
-        return subprocess.Popen(
-            cmd,
-            cwd=self.cfg.hermes_workdir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-        )
+    def start(self, prompt: str, session_id: Optional[str] = None) -> HermesStructuredInvocation:
+        return HermesStructuredInvocation(self.cfg, prompt, session_id).start()
 
-    def collect(self, proc: subprocess.Popen) -> Tuple[str, Optional[str]]:
-        stdout, stderr = proc.communicate()
-        combined = "\n".join(part for part in (stdout.strip(), stderr.strip()) if part)
-        if proc.returncode != 0:
-            raise BridgeError(
-                f"Hermes failed rc={proc.returncode}\nSTDOUT:\n{stdout.strip()}\nSTDERR:\n{stderr.strip()}"
-            )
-        output = stdout.strip()
-        session_id = None
-        match = SESSION_RE.search(output)
-        if match:
-            session_id = match.group(1).strip()
-            output = SESSION_RE.sub("", output).strip()
+    def collect(self, proc: HermesStructuredInvocation) -> Tuple[str, Optional[str]]:
+        proc.wait()
+        result = proc.result or {}
+        if result.get("interrupted"):
+            raise InterruptedError(result.get("error") or "Hermes interrupted")
+        if result.get("error"):
+            raise BridgeError(str(result["error"]))
+        output = str(result.get("response") or "").strip()
+        session_id = result.get("session_id")
         output = self._sanitize_output(output)
-        if not output and combined:
-            output = self._sanitize_output(combined)
         return output, session_id
 
     def _sanitize_output(self, output: str) -> str:
@@ -360,6 +533,7 @@ class HermesRunner:
                 continue
             cleaned_lines.append(line)
         cleaned = "\n".join(cleaned_lines).strip()
+        cleaned = self._strip_leading_tool_preview_blocks(cleaned)
         cleaned = self._collapse_repeated_paragraph_blocks(cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
         return cleaned
@@ -468,6 +642,49 @@ class HermesRunner:
         if best_start is not None:
             return "\n".join(lines[best_start:]).strip()
         return "\n".join(lines).strip()
+
+    def _strip_leading_tool_preview_blocks(self, text: str) -> str:
+        lines = [line.rstrip() for line in text.splitlines()]
+        if not lines:
+            return text
+
+        terminator_re = re.compile(r"^(?:PY|SH|BASH|ZSH)\s+\d+(?:\.\d+)?s$")
+        codeish_re = re.compile(
+            r"^(?:"
+            r"import\s+\w+|from\s+\w+\s+import\s+.+|for\s+.+:|while\s+.+:|if\s+.+:|"
+            r"def\s+\w+\(|class\s+\w+|print\(|path\s*=|model\s*=|segments,\s*info\s*=|"
+            r"mods\s*=|texts\s*=|[A-Za-z_][A-Za-z0-9_]*\s*=.+"
+            r")"
+        )
+        natural_re = re.compile(r"[\u4e00-\u9fff]")
+
+        idx = 0
+        changed = False
+        while idx < len(lines):
+            line = lines[idx].strip()
+            if not line:
+                idx += 1
+                continue
+            if natural_re.search(line) and not codeish_re.match(line):
+                break
+            if not codeish_re.match(line):
+                break
+            terminator_idx: Optional[int] = None
+            for probe in range(idx, min(len(lines), idx + 40)):
+                candidate = lines[probe].strip()
+                if terminator_re.match(candidate):
+                    terminator_idx = probe
+                    break
+                if probe > idx and natural_re.search(candidate) and not codeish_re.match(candidate):
+                    break
+            if terminator_idx is None:
+                break
+            idx = terminator_idx + 1
+            changed = True
+
+        if not changed:
+            return text
+        return "\n".join(lines[idx:]).strip()
 
 
 class SessionStore:

@@ -148,22 +148,24 @@ def test_hermes_runner_uses_resume_and_parses_session_id(bridge, make_cfg, monke
     runner = bridge.HermesRunner(cfg)
     captured = {}
 
-    class FakePopen:
-        def __init__(self, cmd, **kwargs):
-            captured["cmd"] = cmd
-            captured["kwargs"] = kwargs
-            self.returncode = 0
+    def fake_run_structured(cfg_arg, prompt, session_id, invocation):
+        captured["prompt"] = prompt
+        captured["session_id"] = session_id
+        return {
+            "response": "↻ Resumed session old-session (1 user messages, 2 total messages)\n\n╭─ ⚕ Hermes ───────────────────────────────────────────────────────────────────╮\n回复内容\n",
+            "session_id": "sess-123",
+            "error": None,
+            "missing_session": False,
+            "interrupted": False,
+        }
 
-        def communicate(self):
-            return ("↻ Resumed session old-session (1 user messages, 2 total messages)\n\n╭─ ⚕ Hermes ───────────────────────────────────────────────────────────────────╮\n回复内容\n\nsession_id: sess-123\n", "")
-
-    monkeypatch.setattr(bridge.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(bridge, "_run_hermes_structured", fake_run_structured)
 
     proc = runner.start("你好", session_id="old-session")
     output, session_id = runner.collect(proc)
 
-    assert "--resume" in captured["cmd"]
-    assert "old-session" in captured["cmd"]
+    assert captured["prompt"] == "你好"
+    assert captured["session_id"] == "old-session"
     assert output == "回复内容"
     assert session_id == "sess-123"
 
