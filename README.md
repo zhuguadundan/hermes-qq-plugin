@@ -113,11 +113,14 @@ cd hermes-qq-plugin
 bash scripts/install-plugin.sh
 ```
 
-安装完成后，插件代码会进入：
+安装脚本会做两件事：
+- 把插件代码复制到 `~/.hermes/plugins/napcat_qq_bridge`
+- 如果 `~/.hermes/napcat_qq_bridge/config.json` 还不存在，就自动从示例配置生成一份
 
-```text
-~/.hermes/plugins/napcat_qq_bridge
-```
+安装完成后：
+- 插件代码目录：`~/.hermes/plugins/napcat_qq_bridge`
+- 运行目录：`~/.hermes/napcat_qq_bridge`
+- 默认配置文件：`~/.hermes/napcat_qq_bridge/config.json`
 
 ### 4.3 确认 Hermes 能看到插件
 
@@ -368,7 +371,46 @@ systemctl --user enable --now hermes-napcat-qq-bridge.service
 
 ---
 
-## 10. 健康检查
+## 10. 首次启动后的最小自检清单
+
+建议按这个顺序检查：
+
+1. 插件命令是否注册成功
+
+```bash
+hermes napcat-qq-bridge --help
+```
+
+2. NapCat HTTP API 是否可达
+
+```bash
+curl -X POST \
+  http://127.0.0.1:3000/get_login_info \
+  -H 'Authorization: Bearer YOUR_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{}'
+```
+
+3. 启动桥
+
+```bash
+hermes napcat-qq-bridge run
+```
+
+4. 检查健康接口
+
+```bash
+curl http://127.0.0.1:8096/healthz
+```
+
+5. 用白名单 QQ 做一次私聊测试
+6. 在允许的群里做一次 `@机器人` 测试
+
+如果这 6 步都过了，基本就不用再盲目 debug 了。
+
+---
+
+## 11. 健康检查
 
 ```bash
 curl http://127.0.0.1:8096/healthz
@@ -390,7 +432,7 @@ curl http://127.0.0.1:8096/healthz
 
 ---
 
-## 11. 聊天命令
+## 12. 聊天命令
 
 支持：
 - `/new` / `/reset`
@@ -406,7 +448,7 @@ curl http://127.0.0.1:8096/healthz
 
 ---
 
-## 12. 媒体回复规则
+## 13. 媒体回复规则
 
 如果 Hermes 想给 QQ 发本地文件，需要这样返回：
 
@@ -431,7 +473,7 @@ MEDIA:/absolute/path/to/audio.ogg
 
 ---
 
-## 13. 常见排错
+## 14. 常见排错
 
 ### 13.1 私聊没回复
 
@@ -477,7 +519,7 @@ curl -X POST \
 
 ---
 
-## 14. 测试
+## 15. 测试
 
 ```bash
 cd hermes-qq-plugin
@@ -486,7 +528,7 @@ cd hermes-qq-plugin
 
 ---
 
-## 15. 仓库结构
+## 16. 仓库结构
 
 ```text
 .
@@ -505,7 +547,7 @@ cd hermes-qq-plugin
 
 ---
 
-## 16. 说明
+## 17. 说明
 
 这个仓库是 NapCat / OneBot 个人 QQ 的桥接插件仓库。
 
