@@ -24,6 +24,24 @@ NapCat / OneBot 到 Hermes 的 QQ 桥接组件。
 - 把 Hermes 返回的文本 / `MEDIA:` 文件发回 QQ
 - 为每个聊天维护独立 session
 - 处理中收到 follow-up 时中断并合并
+- 回复优先取 Hermes 的结构化最终结果，不再依赖 CLI stdout 抓正文
+
+## 修复后的行为
+
+- 同一个 QQ 私聊或群聊会绑定固定 Hermes session，自动 `--resume`
+- 群聊 session 默认按“群 + 发言人”隔离
+- 支持 `/new`、`/reset`、`/status`、`/stop`、`/help`
+- 支持私聊/群聊文本、图片、语音、视频、普通文件
+- 群文件上传 notice 会进入会话
+- 群聊默认只在 `@机器人` 或回复机器人消息时触发
+- 默认安全策略是 deny-all，必须显式配置 allowlist 或 `--allow-all`
+- 按聊天串行处理；处理中收到新消息时会中断并合并 follow-up
+- WS 重连后会按允许名单做一次历史补拉兜底
+- 普通文件优先走 `get_private_file_url` / `get_group_file_url` / `get_file`
+- 图片优先尝试 `get_image` 刷新 URL
+- 语音优先走 `get_record`
+- 文件上传走 NapCat Stream API 分片格式
+- 会过滤 Hermes CLI 的噪音和重复段落作为兜底保护
 
 ## 触发规则
 
@@ -63,15 +81,8 @@ NapCat / OneBot 到 Hermes 的 QQ 桥接组件。
 - `workdir`: Hermes 工作目录
 - `model`: 可选模型
 - `provider`: 可选 provider
-- `toolsets`: 允许的工具集
+- `toolsets`: 预加载工具集
 - `skills`: 预加载 skills
-
-## NapCat 建议
-
-- HTTP Server 开启
-- WebSocket Server 开启
-- HTTP Client 建议关闭
-- `messagePostFormat: array`
 
 ## 健康检查
 
