@@ -1,10 +1,14 @@
-# napcat_qq_bridge
+# napcat_qq_bridge（legacy）
 
 NapCat / OneBot 到 Hermes 的 QQ 桥接组件。
 
-如果你只关心“怎么安装、怎么配私聊和群聊、怎么启动”，优先看仓库根目录 `README.md`。
+> 当前状态：**legacy / archive**
+>
+> 新部署请优先使用 Hermes 主仓库里的原生 QQ 适配器：`gateway/platforms/qq.py`
 
-这个文件提供组件级补充说明。
+如果你只关心“现在应该怎么接 QQ”，优先看仓库根目录 `README.md`。
+
+这个文件仅保留组件级补充说明，供历史实现排查和回滚参考。
 
 ## 1. 默认路径
 
@@ -26,7 +30,7 @@ NapCat / OneBot 到 Hermes 的 QQ 桥接组件。
 - 处理中收到 follow-up 时中断并合并
 - 回复优先取 Hermes 的结构化最终结果，不再依赖 CLI stdout 抓正文
 
-## 3. 当前行为
+## 3. 当前行为（旧桥实现）
 
 - 同一个 QQ 私聊或群聊会绑定固定 Hermes session，自动 `--resume`
 - 群聊 session 默认按“群 + 发言人”隔离
@@ -41,6 +45,8 @@ NapCat / OneBot 到 Hermes 的 QQ 桥接组件。
 - 图片优先尝试 `get_image` 刷新 URL
 - 语音优先走 `get_record`
 - 文件上传走 NapCat Stream API 分片格式
+
+> 说明：Hermes 原生 QQ 适配器已经支持把 **同一个 QQ 群** 配成共享上下文（`group_sessions_per_user: false`），因此主线方案不再受这个“群 + 发言人隔离”的旧限制。
 
 ## 4. 关键配置
 
