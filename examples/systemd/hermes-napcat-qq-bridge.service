@@ -1,13 +1,14 @@
 [Unit]
-Description=Hermes NapCat QQ Bridge
+Description=Hermes NapCat QQ Personal Bridge
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/YOUR_USER
+WorkingDirectory=%h
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/YOUR_USER/.hermes/hermes-agent/venv/bin/python3 /home/YOUR_USER/.hermes/plugins/napcat_qq_bridge/bridge.py run --config-file /home/YOUR_USER/.hermes/napcat_qq_bridge/config.json
+Environment=HERMES_HOME=%h/.hermes
+ExecStart=%h/.hermes/hermes-agent/venv/bin/python3 %h/.hermes/plugins/napcat_qq_bridge/bridge.py run --config-file %h/.hermes/napcat_qq_bridge/config.json
 Restart=always
 RestartSec=3
 

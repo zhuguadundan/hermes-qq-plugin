@@ -3,6 +3,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import inspect
 import json
 import mimetypes
 import os
@@ -13,8 +14,10 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
@@ -32,6 +35,7 @@ AUDIO_EXTS = {".aac", ".amr", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", 
 IMAGE_EXTS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 VIDEO_EXTS = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+BRIDGE_LOCAL_COMMANDS = {"/new", "/reset", "/status", "/stop", "/help"}
 
 
 class BridgeError(RuntimeError):
@@ -62,6 +66,7 @@ class BridgeConfig:
     allowed_group_user_ids: List[str]
     allow_all: bool
     group_chat_all: bool
+    group_sessions_per_user: bool
     hermes_bin: str
     hermes_workdir: str
     hermes_model: str
@@ -76,6 +81,8 @@ class BridgeConfig:
     poll_history_count: int
     poll_backfill_seconds: int
     ws_reconnect_delay: float
+    enable_online_file: bool
+    auto_approve_dangerous_commands: bool
     verbose: bool
 
 
@@ -84,6 +91,7 @@ class QueuedEvent:
     source: EventSource
     event: Dict[str, Any]
     chat_key: str
+    command_text: Optional[str] = None
 
 
 @dataclass
@@ -302,10 +310,18 @@ class NapCatClient:
 
 
 class HermesStructuredInvocation:
-    def __init__(self, cfg: BridgeConfig, prompt: str, session_id: Optional[str]):
+    def __init__(
+        self,
+        cfg: BridgeConfig,
+        prompt: str,
+        session_id: Optional[str],
+        *,
+        command_mode: bool = False,
+    ):
         self.cfg = cfg
         self.prompt = prompt
         self.session_id = session_id
+        self.command_mode = command_mode
         self._lock = threading.Lock()
         self._done = threading.Event()
         self._thread = threading.Thread(target=self._run, name="hermes-structured-runner", daemon=True)
@@ -365,7 +381,10 @@ class HermesStructuredInvocation:
 
     def _run(self) -> None:
         try:
-            payload = _run_hermes_structured(self.cfg, self.prompt, self.session_id, self)
+            if self.command_mode:
+                payload = _run_hermes_command_structured(self.cfg, self.prompt, self.session_id, self)
+            else:
+                payload = _run_hermes_structured(self.cfg, self.prompt, self.session_id, self)
         except Exception as exc:
             payload = {
                 "response": "",
@@ -459,11 +478,16 @@ def _run_hermes_structured(
     turn_route = cli._resolve_turn_agent_config(prompt)
     if turn_route["signature"] != cli._active_agent_route_signature:
         cli.agent = None
-    if not cli._init_agent(
-        model_override=turn_route["model"],
-        runtime_override=turn_route["runtime"],
-        route_label=turn_route["label"],
-    ):
+    _init_sig = inspect.signature(cli._init_agent)
+    _init_kwargs = {
+        "model_override": turn_route["model"],
+        "runtime_override": turn_route["runtime"],
+    }
+    if "request_overrides" in _init_sig.parameters:
+        _init_kwargs["request_overrides"] = turn_route.get("request_overrides")
+    elif "route_label" in _init_sig.parameters and "label" in turn_route:
+        _init_kwargs["route_label"] = turn_route.get("label")
+    if not cli._init_agent(**_init_kwargs):
         raise BridgeError("Failed to initialize Hermes agent")
 
     agent = cli.agent
@@ -485,10 +509,37 @@ def _run_hermes_structured(
 
     invocation._bind_agent(agent)
 
-    result = agent.run_conversation(
-        user_message=prompt,
-        conversation_history=cli.conversation_history,
-    )
+    approval_token = None
+    approval_session_key = cli.session_id or session_id or f"qq:{uuid.uuid4().hex[:12]}"
+    yolo_enabled = False
+    try:
+        from tools.approval import (
+            disable_session_yolo,
+            enable_session_yolo,
+            reset_current_session_key,
+            set_current_session_key,
+        )
+        approval_token = set_current_session_key(approval_session_key)
+        if cfg.auto_approve_dangerous_commands:
+            enable_session_yolo(approval_session_key)
+            yolo_enabled = True
+    except Exception:
+        approval_token = None
+
+    try:
+        result = agent.run_conversation(
+            user_message=prompt,
+            conversation_history=cli.conversation_history,
+        )
+    finally:
+        try:
+            if yolo_enabled:
+                disable_session_yolo(approval_session_key)
+            if approval_token is not None:
+                reset_current_session_key(approval_token)
+        except Exception:
+            pass
+
     interrupted = bool(result.get("interrupted")) if isinstance(result, dict) else False
     if interrupted:
         raise InterruptedError(result.get("final_response") if isinstance(result, dict) else "Hermes interrupted")
@@ -502,12 +553,132 @@ def _run_hermes_structured(
     }
 
 
+def _run_hermes_command_structured(
+    cfg: BridgeConfig,
+    command_text: str,
+    session_id: Optional[str],
+    invocation: HermesStructuredInvocation,
+) -> Dict[str, Any]:
+    project_root = _resolve_hermes_project_root(cfg)
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+    from agent.skill_commands import build_preloaded_skills_prompt
+    from cli import HermesCLI
+    from hermes_cli.commands import resolve_command
+    from agent.skill_commands import resolve_skill_command_key
+
+    os.environ["HERMES_SESSION_SOURCE"] = "tool"
+
+    cli = HermesCLI(
+        model=cfg.hermes_model or None,
+        toolsets=_parse_toolsets(cfg.hermes_toolsets),
+        provider=cfg.hermes_provider or None,
+        verbose=False,
+        compact=True,
+        resume=session_id,
+    )
+    cli.tool_progress_mode = "off"
+    cli.streaming_enabled = False
+
+    if cfg.hermes_skills:
+        skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
+            cfg.hermes_skills,
+            task_id=cli.session_id,
+        )
+        if missing_skills:
+            raise BridgeError(f"Unknown skill(s): {', '.join(missing_skills)}")
+        if skills_prompt:
+            cli.system_prompt = "\n\n".join(part for part in (cli.system_prompt, skills_prompt) if part).strip()
+            cli.preloaded_skills = loaded_skills
+
+    if session_id and cli._session_db and not cli._session_db.get_session(session_id):
+        return {
+            "response": "",
+            "session_id": session_id,
+            "error": f"Session not found: {session_id}",
+            "missing_session": True,
+            "interrupted": False,
+        }
+
+    normalized = command_text.strip()
+    base_word = normalized.split(maxsplit=1)[0].lstrip("/").lower() if normalized else ""
+    command_known = resolve_command(base_word) is not None
+    skill_known = resolve_skill_command_key(base_word) is not None if base_word else False
+
+    if not command_known and not skill_known:
+        return {
+            "response": f"Unknown command: {normalized}\nType /help for available commands",
+            "session_id": cli.session_id,
+            "error": None,
+            "missing_session": False,
+            "interrupted": False,
+        }
+
+    if base_word == "model" and normalized == "/model":
+        current_model = getattr(cli, "model", "") or "(not set)"
+        current_provider = getattr(cli, "provider", "") or "auto"
+        return {
+            "response": (
+                "当前模型状态\n"
+                f"- model: {current_model}\n"
+                f"- provider: {current_provider}\n\n"
+                "QQ 桥接暂不支持交互式模型选择器。\n"
+                "请使用 `/model <模型名>`，例如：`/model gpt-5.5`"
+            ),
+            "session_id": cli.session_id,
+            "error": None,
+            "missing_session": False,
+            "interrupted": False,
+        }
+
+    command_arg = normalized.split(maxsplit=1)[1].strip() if len(normalized.split(maxsplit=1)) > 1 else ""
+
+    output_buffer = StringIO()
+    error_buffer = StringIO()
+    with redirect_stdout(output_buffer), redirect_stderr(error_buffer):
+        keep_running = cli.process_command(normalized)
+
+    stdout_text = output_buffer.getvalue()
+    stderr_text = error_buffer.getvalue()
+    combined = "\n".join(part for part in (stdout_text, stderr_text) if part.strip()).strip()
+
+    if not combined and keep_running:
+        if base_word == "reasoning":
+            if command_arg:
+                combined = f"已更新 reasoning 设置：{command_arg}"
+            else:
+                combined = "已处理 /reasoning 命令。"
+        elif base_word == "model":
+            combined = "已处理 /model 命令。"
+        else:
+            combined = "命令已执行。"
+    elif not keep_running and not combined:
+        combined = "当前命令会请求退出 CLI，这在 QQ 桥接中不可用。"
+
+    return {
+        "response": combined,
+        "session_id": cli.session_id,
+        "error": None,
+        "missing_session": False,
+        "interrupted": False,
+    }
+
+
 class HermesRunner:
     def __init__(self, cfg: BridgeConfig):
         self.cfg = cfg
 
     def start(self, prompt: str, session_id: Optional[str] = None) -> HermesStructuredInvocation:
         return HermesStructuredInvocation(self.cfg, prompt, session_id).start()
+
+    def start_command(self, command_text: str, session_id: Optional[str] = None) -> HermesStructuredInvocation:
+        return HermesStructuredInvocation(
+            self.cfg,
+            command_text,
+            session_id,
+            command_mode=True,
+        ).start()
 
     def collect(self, proc: HermesStructuredInvocation) -> Tuple[str, Optional[str]]:
         proc.wait()
@@ -869,12 +1040,28 @@ class BridgeApp:
             if self.cfg.verbose:
                 self.log(f"{origin} ignored group-message-not-directed chat={self.chat_key(source)} message_id={source.message_id}")
             return 200, {"ok": True, "ignored": "group-message-not-directed"}
-        command, _arg = self.extract_command(normalized, source)
+        command, arg = self.extract_command(normalized, source)
         if command:
             if self.cfg.verbose:
                 self.log(f"{origin} command={command} chat={self.chat_key(source)} message_id={source.message_id}")
-            self.handle_control_command(command, source)
-            return 200, {"ok": True, "command": command}
+            if self.is_local_command(command):
+                self.handle_control_command(command, source)
+                return 200, {"ok": True, "command": command, "scope": "bridge-local"}
+            status = self.chat_status(self.chat_key(source))
+            if status["running"]:
+                self.napcat.send_text(
+                    source,
+                    "当前正在处理上一条消息。请等待完成，或发送 /stop 中断后再执行该命令。",
+                )
+                return 200, {"ok": True, "command": command, "scope": "busy-rejected"}
+            raw_command = command if not arg else f"{command} {arg}"
+            queue_size = self.enqueue_event(source, normalized, command_text=raw_command)
+            if self.cfg.verbose:
+                self.log(
+                    f"{origin} queued-command={raw_command} chat={self.chat_key(source)} "
+                    f"message_id={source.message_id} queue_size={queue_size}"
+                )
+            return 202, {"ok": True, "command": raw_command, "queued": True, "queue_size": queue_size, "scope": "hermes"}
         queue_size = self.enqueue_event(source, normalized)
         if self.cfg.verbose:
             self.log(f"{origin} queued chat={self.chat_key(source)} message_id={source.message_id} queue_size={queue_size}")
@@ -995,10 +1182,13 @@ class BridgeApp:
         command, _, arg = joined.partition(" ")
         return command.lower(), arg.strip()
 
-    def enqueue_event(self, source: EventSource, event: dict) -> int:
+    def is_local_command(self, command: str) -> bool:
+        return command in BRIDGE_LOCAL_COMMANDS
+
+    def enqueue_event(self, source: EventSource, event: dict, command_text: Optional[str] = None) -> int:
         chat_key = self.chat_key(source)
         state = self._chat_state(chat_key)
-        task = QueuedEvent(source=source, event=event, chat_key=chat_key)
+        task = QueuedEvent(source=source, event=event, chat_key=chat_key, command_text=command_text)
         proc: Optional[subprocess.Popen] = None
         with state.lock:
             if not state.worker_active:
@@ -1043,15 +1233,20 @@ class BridgeApp:
     def _process_task(self, task: QueuedEvent) -> None:
         state = self._chat_state(task.chat_key)
         try:
-            prompt = self.build_prompt(task.event, task.source)
+            prompt = ""
+            if not task.command_text:
+                prompt = self.build_prompt(task.event, task.source)
             if self._consume_cancel_requested(state):
                 if self.cfg.verbose:
                     self.log(f"cancelled chat={task.chat_key} before Hermes start")
                 return
-            if not prompt.strip():
-                self.napcat.send_text(task.source, "没有可处理的消息内容。")
-                return
-            response, session_id = self._run_hermes_with_recovery(prompt, task.chat_key, state)
+            if task.command_text:
+                response, session_id = self._run_hermes_command_with_recovery(task.command_text, task.chat_key, state)
+            else:
+                if not prompt.strip():
+                    self.napcat.send_text(task.source, "没有可处理的消息内容。")
+                    return
+                response, session_id = self._run_hermes_with_recovery(prompt, task.chat_key, state)
             if self._consume_cancel_requested(state):
                 if self.cfg.verbose:
                     self.log(f"cancelled chat={task.chat_key} after Hermes exit")
@@ -1091,8 +1286,29 @@ class BridgeApp:
                 return self._run_hermes(prompt, state, session_id=None)
             raise
 
+    def _run_hermes_command_with_recovery(self, command_text: str, chat_key: str, state: ChatSessionState) -> Tuple[str, Optional[str]]:
+        session_id = self.sessions.get(chat_key)
+        try:
+            return self._run_hermes_command(command_text, state, session_id=session_id)
+        except Exception as exc:
+            if session_id and self.is_missing_session_error(exc):
+                self.sessions.clear(chat_key)
+                return self._run_hermes_command(command_text, state, session_id=None)
+            raise
+
     def _run_hermes(self, prompt: str, state: ChatSessionState, session_id: Optional[str]) -> Tuple[str, Optional[str]]:
         proc = self.hermes.start(prompt, session_id=session_id)
+        with state.lock:
+            state.active_process = proc
+        try:
+            return self.hermes.collect(proc)
+        finally:
+            with state.lock:
+                if state.active_process is proc:
+                    state.active_process = None
+
+    def _run_hermes_command(self, command_text: str, state: ChatSessionState, session_id: Optional[str]) -> Tuple[str, Optional[str]]:
+        proc = self.hermes.start_command(command_text, session_id=session_id)
         with state.lock:
             state.active_process = proc
         try:
@@ -1133,10 +1349,11 @@ class BridgeApp:
         if command == "/help":
             self.napcat.send_text(
                 source,
-                "可用命令：/new /reset 重置会话，/status 查看状态，/stop 停止当前处理，/help 查看帮助。",
+                "桥接本地命令：/new /reset /status /stop /help\n"
+                "其他 Hermes 命令（如 /model /reasoning /usage /compress）会透传给 Hermes 处理。",
             )
             return
-        self.napcat.send_text(source, f"不支持的命令：{command}")
+        self.napcat.send_text(source, f"未处理的本地命令：{command}")
 
     def stop_chat(self, chat_key: str, clear_queue: bool) -> bool:
         state = self._chat_state(chat_key)
@@ -1533,7 +1750,9 @@ class BridgeApp:
 
     def chat_key(self, source: EventSource) -> str:
         if source.group_id:
-            return f"group:{source.group_id}:user:{source.user_id}"
+            if self.cfg.group_sessions_per_user:
+                return f"group:{source.group_id}:user:{source.user_id}"
+            return f"group:{source.group_id}"
         return f"private:{source.user_id}"
 
     def message_segments(self, event: dict) -> List[dict]:
@@ -1693,6 +1912,8 @@ class BridgeApp:
         return self.download_first(candidates, prefix="file", fallback_name=self.guess_name(data, "file.bin"))
 
     def resolve_online_file(self, source: EventSource, data: dict) -> Optional[str]:
+        if not self.cfg.enable_online_file:
+            return None
         msg_id = str(data.get("msgId") or data.get("msg_id") or "") or None
         element_id = str(data.get("elementId") or data.get("element_id") or "") or None
         candidates: List[Optional[str]] = [data.get("path"), data.get("file"), data.get("url")]
@@ -1828,6 +2049,9 @@ class BridgeApp:
             "allowed_groups": len(self.cfg.allowed_group_ids),
             "allowed_group_users": len(self.cfg.allowed_group_user_ids),
             "group_chat_all": self.cfg.group_chat_all,
+            "group_sessions_per_user": self.cfg.group_sessions_per_user,
+            "enable_online_file": self.cfg.enable_online_file,
+            "auto_approve_dangerous_commands": self.cfg.auto_approve_dangerous_commands,
             "poll_interval": self.cfg.poll_interval,
             "poll_history_count": self.cfg.poll_history_count,
             "poll_backfill_seconds": self.cfg.poll_backfill_seconds,
@@ -1987,6 +2211,7 @@ _CONFIG_VALUE_PATHS = {
     ],
     "allow_all": [("allow_all",), ("auth", "allow_all")],
     "group_chat_all": [("group_chat_all",), ("bridge", "group_chat_all"), ("auth", "group_chat_all")],
+    "group_sessions_per_user": [("group_sessions_per_user",), ("bridge", "group_sessions_per_user")],
     "hermes_bin": [("hermes_bin",), ("hermes", "bin")],
     "hermes_workdir": [("hermes_workdir",), ("hermes", "workdir")],
     "hermes_model": [("hermes_model",), ("hermes", "model")],
@@ -2001,6 +2226,8 @@ _CONFIG_VALUE_PATHS = {
     "poll_history_count": [("poll_history_count",), ("bridge", "poll_history_count")],
     "poll_backfill_seconds": [("poll_backfill_seconds",), ("bridge", "poll_backfill_seconds")],
     "ws_reconnect_delay": [("ws_reconnect_delay",), ("bridge", "ws_reconnect_delay")],
+    "enable_online_file": [("enable_online_file",), ("bridge", "enable_online_file")],
+    "auto_approve_dangerous_commands": [("auto_approve_dangerous_commands",), ("bridge", "auto_approve_dangerous_commands")],
     "verbose": [("verbose",), ("bridge", "verbose")],
 }
 
@@ -2085,7 +2312,7 @@ def _coerce_list(value: Any) -> List[str]:
 
 
 def _pick_value(attr: str, args: argparse.Namespace, config: Dict[str, Any], cli_overrides: Set[str]) -> Any:
-    current = getattr(args, attr)
+    current = getattr(args, attr, None)
     if attr in cli_overrides:
         return current
     configured = _config_lookup(config, attr)
@@ -2111,6 +2338,7 @@ def args_to_config(args: argparse.Namespace) -> BridgeConfig:
         allowed_group_user_ids=_coerce_list(_pick_value("allow_group_user", args, config_data, cli_overrides)),
         allow_all=bool(_pick_value("allow_all", args, config_data, cli_overrides)),
         group_chat_all=bool(_pick_value("group_chat_all", args, config_data, cli_overrides)),
+        group_sessions_per_user=bool(_pick_value("group_sessions_per_user", args, config_data, cli_overrides)),
         hermes_bin=str(_pick_value("hermes_bin", args, config_data, cli_overrides)),
         hermes_workdir=str(_pick_value("hermes_workdir", args, config_data, cli_overrides)),
         hermes_model=str(_pick_value("hermes_model", args, config_data, cli_overrides)),
@@ -2125,6 +2353,8 @@ def args_to_config(args: argparse.Namespace) -> BridgeConfig:
         poll_history_count=int(_pick_value("poll_history_count", args, config_data, cli_overrides)),
         poll_backfill_seconds=int(_pick_value("poll_backfill_seconds", args, config_data, cli_overrides)),
         ws_reconnect_delay=float(_pick_value("ws_reconnect_delay", args, config_data, cli_overrides)),
+        enable_online_file=bool(_pick_value("enable_online_file", args, config_data, cli_overrides)),
+        auto_approve_dangerous_commands=bool(_pick_value("auto_approve_dangerous_commands", args, config_data, cli_overrides)),
         verbose=bool(_pick_value("verbose", args, config_data, cli_overrides)),
     )
 

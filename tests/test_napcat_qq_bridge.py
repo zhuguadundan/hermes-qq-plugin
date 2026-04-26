@@ -54,6 +54,7 @@ def make_cfg(bridge, tmp_path):
             allowed_group_user_ids=[],
             allow_all=False,
             group_chat_all=False,
+            group_sessions_per_user=True,
             hermes_bin="hermes",
             hermes_workdir=str(tmp_path),
             hermes_model="",
@@ -68,6 +69,8 @@ def make_cfg(bridge, tmp_path):
             poll_history_count=20,
             poll_backfill_seconds=180,
             ws_reconnect_delay=3.0,
+            enable_online_file=True,
+            auto_approve_dangerous_commands=False,
             verbose=False,
         )
         values.update(overrides)
@@ -510,3 +513,17 @@ def test_startup_check_runs_websocket_preflight_in_ws_mode(bridge, make_cfg):
 
     assert result["user_id"] == "42"
     assert called == [True]
+
+
+def test_group_chat_key_can_be_shared_per_group(bridge, make_cfg):
+    app = bridge.BridgeApp(make_cfg(group_sessions_per_user=False))
+    source = bridge.EventSource(user_id="10001", group_id="20001", message_id="7", self_id="42", raw={})
+
+    assert app.chat_key(source) == "group:20001"
+
+
+def test_resolve_online_file_can_be_disabled(bridge, make_cfg):
+    app = bridge.BridgeApp(make_cfg(enable_online_file=False))
+    source = bridge.EventSource(user_id="10001", group_id=None, message_id="7", self_id="42", raw={})
+
+    assert app.resolve_online_file(source, {"msgId": "m1", "elementId": "e1"}) is None
