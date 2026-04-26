@@ -2,7 +2,7 @@
 
 # Hermes NapCat QQ Personal Bridge
 
-这是一个把 **NapCat / OneBot / QQ个人号** 接到 **Hermes Agent** 的桥接仓库。
+这是一个把 **NapCat / OneBot / QQ个人号** 接到 **Hermes Agent** 的桥接仓库。仅支持Hermes Agent v0.11.0 (2026.4.23)
 
 > ## 最短安装卡片
 > 
