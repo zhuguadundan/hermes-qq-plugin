@@ -266,7 +266,7 @@ def test_build_prompt_resolves_online_file_segments(bridge, make_cfg):
 
 
 def test_reset_command_clears_session_and_pending_queue(bridge, make_cfg):
-    app = bridge.BridgeApp(make_cfg())
+    app = bridge.BridgeApp(make_cfg(hermes_model="gpt-5.5", hermes_provider="custom:local"))
     app.bot_user_id = "42"
     sent = []
     app.napcat.send_text = lambda source, text: sent.append(text)
@@ -284,7 +284,28 @@ def test_reset_command_clears_session_and_pending_queue(bridge, make_cfg):
     assert body["command"] == "/reset"
     assert app.sessions.get(chat_key) is None
     assert state.pending_task is None
-    assert sent[-1].startswith("已重置当前会话")
+    assert sent[-1].startswith("✨ Session reset! Starting fresh.")
+    assert "◆ Model: gpt-5.5" in sent[-1]
+    assert "◆ Provider: custom" in sent[-1]
+
+
+def test_command_output_appends_session_info_for_config_commands(bridge, make_cfg):
+    cfg = make_cfg(hermes_model="gpt-5.5", hermes_provider="custom:local")
+
+    output = bridge._append_session_info_for_command("Reasoning effort: high", "reasoning", cfg)
+
+    assert "Reasoning effort: high" in output
+    assert "◆ Model: gpt-5.5" in output
+    assert "◆ Provider: custom" in output
+
+
+def test_command_output_does_not_duplicate_session_info(bridge, make_cfg):
+    cfg = make_cfg(hermes_model="gpt-5.5", hermes_provider="custom:local")
+    original = "◆ Model: gpt-5.5\n◆ Provider: custom"
+
+    output = bridge._append_session_info_for_command(original, "model", cfg)
+
+    assert output == original
 
 
 def test_enqueue_interrupts_running_process_and_merges_pending_text(bridge, make_cfg):

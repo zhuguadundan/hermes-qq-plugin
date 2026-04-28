@@ -16,7 +16,7 @@ rm -rf "${TARGET_DIR}"
 mv "${TMP_DIR}" "${TARGET_DIR}"
 
 if [ ! -f "${RUNTIME_DIR}/config.json" ]; then
-  cp "${TARGET_DIR}/config.example.json" "${RUNTIME_DIR}/config.json"
+  sed "s#/home/YOUR_USER#${HOME}#g" "${TARGET_DIR}/config.example.json" > "${RUNTIME_DIR}/config.json"
   SEEDED_CONFIG=1
 else
   SEEDED_CONFIG=0

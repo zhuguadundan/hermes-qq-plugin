@@ -32,8 +32,8 @@ NapCat / OneBot 到 Hermes 的 QQ 个人号桥接组件。
 - 群聊 session 可选择：
   - 按“群 + 发言人”隔离
   - 整群共享同一个 session
-- 支持 `/new`、`/reset`、`/status`、`/stop`、`/help`
-- 支持 Hermes slash 命令透传（如 `/reasoning`、`/model` 等）
+- 支持 `/new`、`/reset`、`/status`、`/stop`、`/help`；`/new` 和 `/reset` 会显示当前 Model / Provider / Context
+- 支持 Hermes slash 命令透传（如 `/reasoning`、`/model`、`/fast` 等）；配置类命令会追加 Model / Provider / Context 信息块
 - 支持私聊/群聊文本、图片、语音、视频、普通文件、在线文件
 - 群文件上传 notice 会进入会话
 - 群聊默认只在 `@机器人` 或回复机器人消息时触发

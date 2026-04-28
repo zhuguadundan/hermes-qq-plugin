@@ -11,7 +11,7 @@
     "path": "/napcat",
     "receive_mode": "ws",
     "group_chat_all": false,
-    "group_sessions_per_user": true,
+    "group_sessions_per_user": false,
     "enable_online_file": true,
     "auto_approve_dangerous_commands": false,
     "poll_interval": 0,
@@ -20,21 +20,21 @@
     "ws_reconnect_delay": 3,
     "request_timeout": 60,
     "chunk_size": 65536,
-    "temp_dir": "/home/dawei/.hermes/napcat_qq_bridge/tmp",
-    "state_dir": "/home/dawei/.hermes/napcat_qq_bridge/state"
+    "temp_dir": "/home/YOUR_USER/.hermes/napcat_qq_bridge/tmp",
+    "state_dir": "/home/YOUR_USER/.hermes/napcat_qq_bridge/state"
   },
   "auth": {
     "private_users": [
-      "68912345"
+      "YOUR_QQ_NUMBER"
     ],
     "group_ids": [
-      "12345678"
+      "YOUR_GROUP_ID"
     ],
     "group_users": []
   },
   "hermes": {
     "bin": "hermes",
-    "workdir": "/home/dawei",
+    "workdir": "/home/YOUR_USER",
     "model": "",
     "provider": "",
     "toolsets": "terminal,file,web",

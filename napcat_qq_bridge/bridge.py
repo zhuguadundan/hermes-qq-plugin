@@ -36,6 +36,7 @@ IMAGE_EXTS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 VIDEO_EXTS = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 BRIDGE_LOCAL_COMMANDS = {"/new", "/reset", "/status", "/stop", "/help"}
+SESSION_INFO_COMMANDS = {"new", "reset", "model", "reasoning", "fast"}
 
 
 class BridgeError(RuntimeError):
@@ -426,6 +427,103 @@ def _parse_toolsets(raw: str) -> Optional[List[str]]:
     return toolsets or None
 
 
+def _compact_token_count(value: int) -> str:
+    if value >= 1_000_000:
+        compact = value / 1_000_000
+        return f"{compact:g}M"
+    if value >= 1_000:
+        if value % 1_000 == 0:
+            return f"{value // 1_000}K"
+        return f"{value / 1_000:g}K"
+    return str(value)
+
+
+def _display_provider(provider: Optional[str]) -> str:
+    raw = (provider or "").strip()
+    if not raw:
+        return "openrouter"
+    if raw == "custom" or raw.startswith("custom:"):
+        return "custom"
+    return raw
+
+
+def _format_bridge_session_info(cfg: BridgeConfig, cli: Any = None) -> str:
+    """Return the same model/provider/context summary QQ users expect.
+
+    The official gateway formats this from its in-process runtime state.
+    The QQ personal bridge runs Hermes commands through ``HermesCLI`` instead,
+    so command output needs an equivalent bridge-side formatter.
+    """
+    model = (getattr(cli, "model", None) if cli is not None else None) or cfg.hermes_model or ""
+    provider = (getattr(cli, "provider", None) if cli is not None else None) or cfg.hermes_provider or ""
+    base_url = (getattr(cli, "base_url", None) if cli is not None else None) or ""
+    api_key = (getattr(cli, "api_key", None) if cli is not None else None) or ""
+    config_context_length: Optional[int] = None
+
+    try:
+        project_root = _resolve_hermes_project_root(cfg)
+        if str(project_root) not in sys.path:
+            sys.path.insert(0, str(project_root))
+    except Exception:
+        pass
+
+    try:
+        import yaml
+        from hermes_constants import get_config_path
+
+        config_path = get_config_path()
+        if config_path.exists():
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            model_cfg = data.get("model", {}) if isinstance(data, dict) else {}
+            if isinstance(model_cfg, dict):
+                model = model or str(model_cfg.get("default") or model_cfg.get("model") or "")
+                provider = provider or str(model_cfg.get("provider") or "")
+                base_url = base_url or str(model_cfg.get("base_url") or "")
+                api_key = api_key or str(model_cfg.get("api_key") or "")
+                raw_ctx = model_cfg.get("context_length")
+                if raw_ctx is not None:
+                    try:
+                        config_context_length = int(raw_ctx)
+                    except (TypeError, ValueError):
+                        config_context_length = None
+    except Exception:
+        pass
+
+    context_length: Optional[int] = config_context_length
+    context_source = "配置" if config_context_length is not None else "检测"
+    if context_length is None and model:
+        try:
+            from agent.model_metadata import DEFAULT_FALLBACK_CONTEXT, get_model_context_length
+
+            context_length = get_model_context_length(
+                model,
+                base_url=base_url or "",
+                api_key=api_key or "",
+                config_context_length=config_context_length,
+                provider=provider or "",
+            )
+            if context_length == DEFAULT_FALLBACK_CONTEXT:
+                context_source = "默认"
+        except Exception:
+            context_length = None
+
+    lines = [
+        f"◆ Model: {model or '(not set)'}",
+        f"◆ Provider: {_display_provider(provider)}",
+    ]
+    if context_length is not None:
+        lines.append(f"◆ Context: {_compact_token_count(context_length)} tokens {context_source}")
+    return "\n".join(lines)
+
+
+def _append_session_info_for_command(response: str, base_word: str, cfg: BridgeConfig, cli: Any = None) -> str:
+    text = (response or "").strip()
+    if base_word not in SESSION_INFO_COMMANDS or "◆ Model:" in text:
+        return text
+    info = _format_bridge_session_info(cfg, cli)
+    return f"{text}\n\n{info}" if text else info
+
+
 def _run_hermes_structured(
     cfg: BridgeConfig,
     prompt: str,
@@ -616,13 +714,9 @@ def _run_hermes_command_structured(
         }
 
     if base_word == "model" and normalized == "/model":
-        current_model = getattr(cli, "model", "") or "(not set)"
-        current_provider = getattr(cli, "provider", "") or "auto"
         return {
             "response": (
-                "当前模型状态\n"
-                f"- model: {current_model}\n"
-                f"- provider: {current_provider}\n\n"
+                f"{_format_bridge_session_info(cfg, cli)}\n\n"
                 "QQ 桥接暂不支持交互式模型选择器。\n"
                 "请使用 `/model <模型名>`，例如：`/model gpt-5.5`"
             ),
@@ -655,6 +749,7 @@ def _run_hermes_command_structured(
             combined = "命令已执行。"
     elif not keep_running and not combined:
         combined = "当前命令会请求退出 CLI，这在 QQ 桥接中不可用。"
+    combined = _append_session_info_for_command(combined, base_word, cfg, cli)
 
     return {
         "response": combined,
@@ -1327,7 +1422,11 @@ class BridgeApp:
         if command in ("/new", "/reset"):
             self.sessions.clear(chat_key)
             self.stop_chat(chat_key, clear_queue=True)
-            self.napcat.send_text(source, "已重置当前会话。下一条消息会开启新对话。")
+            self.napcat.send_text(
+                source,
+                "✨ Session reset! Starting fresh.\n\n"
+                f"{_format_bridge_session_info(self.cfg)}",
+            )
             return
         if command == "/stop":
             stopped = self.stop_chat(chat_key, clear_queue=False)
