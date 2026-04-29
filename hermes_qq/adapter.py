@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
@@ -147,31 +148,107 @@ class NapCatQQAdapter(BasePlatformAdapter):
             logger.warning("[QQ] send failed: %s", exc)
             return SendResult(success=False, error=str(exc))
 
-    async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        return await self._send_file_segment(chat_id, image_url, "image", caption)
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: Optional[str] = None,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        file_path: Optional[str] = None,
+        image_path: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        del reply_to, metadata, kwargs
+        media_ref = self._first_media_ref(image_url, image_path, file_path)
+        if not media_ref:
+            return SendResult(success=False, error="QQ image send missing image_url/image_path/file_path")
+        return await self._send_file_segment(chat_id, media_ref, "image", caption)
 
-    async def send_voice(self, chat_id: str, voice_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        return await self._send_file_segment(chat_id, voice_url, "record", caption)
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        del reply_to, metadata, kwargs
+        return await self.send_image(chat_id=chat_id, image_path=image_path, caption=caption)
 
-    async def send_video(self, chat_id: str, video_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        return await self._send_file_segment(chat_id, video_url, "video", caption)
+    async def send_voice(
+        self,
+        chat_id: str,
+        voice_url: Optional[str] = None,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        audio_path: Optional[str] = None,
+        file_path: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        del reply_to, metadata, kwargs
+        media_ref = self._first_media_ref(audio_path, voice_url, file_path)
+        if not media_ref:
+            return SendResult(success=False, error="QQ voice send missing audio_path/voice_url/file_path")
+        return await self._send_file_segment(chat_id, media_ref, "record", caption)
 
-    async def send_document(self, chat_id: str, document_url: str, filename: Optional[str] = None, caption: Optional[str] = None, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+    async def send_video(
+        self,
+        chat_id: str,
+        video_url: Optional[str] = None,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        video_path: Optional[str] = None,
+        file_path: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        del reply_to, metadata, kwargs
+        media_ref = self._first_media_ref(video_path, video_url, file_path)
+        if not media_ref:
+            return SendResult(success=False, error="QQ video send missing video_path/video_url/file_path")
+        return await self._send_file_segment(chat_id, media_ref, "video", caption)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        document_url: Optional[str] = None,
+        filename: Optional[str] = None,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        file_path: Optional[str] = None,
+        file_name: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        del reply_to, metadata, kwargs
+        media_ref = self._first_media_ref(file_path, document_url)
+        if not media_ref:
+            return SendResult(success=False, error="QQ document send missing file_path/document_url")
+        if self._is_remote_ref(media_ref):
+            text = f"{caption}\n{media_ref}" if caption else media_ref
+            return await self.send(chat_id=chat_id, content=text)
+
         source = self._source_from_chat_id(chat_id)
         try:
-            path = Path(document_url).expanduser().resolve()
+            path = self._local_path(media_ref)
+            if not path.exists():
+                return SendResult(success=False, error=f"QQ document file not found: {path}")
+            display_name = file_name or filename or path.name
             if source.group_id:
-                remote = await asyncio.to_thread(self._client.upload_file_stream, str(path))
+                remote = await self._upload_local_file_with_fallback(path)
                 result = await asyncio.to_thread(
                     self._client.call,
                     "upload_group_file",
-                    {"group_id": source.group_id, "file": remote, "name": filename or path.name},
+                    {"group_id": source.group_id, "file": remote, "name": display_name},
                 )
             else:
                 result = await asyncio.to_thread(
                     self._client.call,
                     "send_online_file",
-                    {"user_id": source.user_id, "file_path": str(path), "file_name": filename or path.name},
+                    {"user_id": source.user_id, "file_path": str(path), "file_name": display_name},
                 )
             return SendResult(success=True, raw_response=result)
         except Exception as exc:
@@ -183,8 +260,12 @@ class NapCatQQAdapter(BasePlatformAdapter):
     async def _send_file_segment(self, chat_id: str, path_or_url: str, segment_type: str, caption: Optional[str]) -> SendResult:
         source = self._source_from_chat_id(chat_id)
         try:
-            path = Path(path_or_url).expanduser()
-            remote = await asyncio.to_thread(self._client.upload_file_stream, str(path))
+            remote = path_or_url
+            if not self._is_remote_ref(path_or_url):
+                path = self._local_path(path_or_url)
+                if not path.exists():
+                    return SendResult(success=False, error=f"QQ {segment_type} file not found: {path}")
+                remote = await self._upload_local_file_with_fallback(path)
             segments = []
             if caption:
                 segments.append({"type": "text", "data": {"text": caption}})
@@ -193,6 +274,47 @@ class NapCatQQAdapter(BasePlatformAdapter):
             return SendResult(success=True, raw_response=result)
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
+
+    @staticmethod
+    def _first_media_ref(*values: Optional[str]) -> Optional[str]:
+        for value in values:
+            if value:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _is_remote_ref(value: str) -> bool:
+        return bool(re.match(r"^(?:https?|base64)://|^data:", value, flags=re.IGNORECASE))
+
+    @staticmethod
+    def _local_path(value: str) -> Path:
+        if value.startswith("file://"):
+            value = value[len("file://") :]
+        return Path(value).expanduser().resolve()
+
+    async def _upload_local_file_with_fallback(self, path: Path) -> str:
+        try:
+            return await asyncio.to_thread(self._client.upload_file_stream, str(path))
+        except Exception as exc:
+            logger.warning(
+                "[QQ] upload_file_stream failed for %s; falling back to direct local path: %s",
+                path.name,
+                exc,
+            )
+            return str(path)
+
+    @staticmethod
+    def _websocket_connect_kwargs(headers: Optional[Dict[str, str]]) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {"ping_interval": None, "max_size": 2 * 1024 * 1024}
+        if not headers:
+            return kwargs
+        try:
+            parameters = inspect.signature(websockets.connect).parameters if websockets else {}
+        except (TypeError, ValueError):
+            parameters = {}
+        header_param = "additional_headers" if "additional_headers" in parameters else "extra_headers"
+        kwargs[header_param] = headers
+        return kwargs
 
     def _source_from_chat_id(self, chat_id: str) -> QQEventSource:
         if str(chat_id).startswith("group:"):
@@ -208,10 +330,10 @@ class NapCatQQAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 headers = {"Authorization": f"Bearer {self.onebot_ws_token}"} if self.onebot_ws_token else None
-                try:
-                    ws_ctx = websockets.connect(self.onebot_ws_url, additional_headers=headers, ping_interval=None, max_size=2 * 1024 * 1024)
-                except TypeError:
-                    ws_ctx = websockets.connect(self.onebot_ws_url, extra_headers=headers, ping_interval=None, max_size=2 * 1024 * 1024)
+                ws_ctx = websockets.connect(
+                    self.onebot_ws_url,
+                    **self._websocket_connect_kwargs(headers),
+                )
                 async with ws_ctx as ws:
                     self._mark_connected()
                     logger.info("[QQ] WebSocket connected: %s", self.onebot_ws_url)
