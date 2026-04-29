@@ -1,0 +1,48 @@
+# Merge this into ~/.hermes/config.yaml.
+platforms:
+  qq:
+    enabled: true
+    extra:
+      # NapCat/OneBot HTTP and WebSocket endpoints.
+      onebot_url: http://127.0.0.1:3000
+      onebot_token: YOUR_NAPCAT_TOKEN
+      onebot_ws_url: ws://127.0.0.1:3001
+      onebot_ws_token: YOUR_NAPCAT_TOKEN
+
+      # Access policy.  Use allowlist for personal deployments.
+      dm_policy: allowlist          # open | allowlist | disabled
+      group_policy: allowlist       # open | allowlist | disabled
+      allow_from:
+        - '123456789'               # QQ user id allowed in private chat
+      group_allow_from:
+        - '987654321'               # QQ group id allowed for group chat
+      allowed_group_users: []       # optional user-id allowlist inside groups
+
+      # Group behavior.
+      group_chat_all: true          # true = respond to all group messages in allowed groups
+      group_sessions_per_user: false
+
+      # Media/runtime options.
+      request_timeout: 60
+      chunk_size: 65536
+      enable_online_file: true
+      batch_delay_seconds: 1.2      # merge image + follow-up text events
+
+    # Optional home channel for cron/cross-platform delivery.
+    home_channel:
+      platform: qq
+      chat_id: group:987654321
+      name: QQ group 987654321
+
+  # Strongly recommended if you only use personal QQ/NapCat.
+  qqbot:
+    enabled: false
+
+# QQ cannot edit messages, so keep permanent progress noise low.
+display:
+  platforms:
+    qq:
+      tool_progress: off
+      streaming: false
+      interim_assistant_messages: false
+      show_reasoning: false

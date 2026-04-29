@@ -1,359 +1,283 @@
-# Hermes QQ 个人号插件（NapCat / OneBot）
+# Hermes QQ Plugin — Native NapCat / OneBot Personal QQ Adapter
 
-> 把 **QQ 个人号** 接进 Hermes Agent：适合家庭群、朋友群、私聊里的 AI 助手。  
-> 它不是腾讯官方 QQ Bot API，而是通过 **NapCat + OneBot** 使用个人号收发消息。
+This repository provides a **native Hermes Gateway platform adapter** for
+personal QQ accounts through [NapCat](https://napneko.github.io/) / OneBot 11.
 
-## 最短安装卡片
+It is not the old `HermesCLI` bridge.  The adapter turns OneBot events into
+Hermes native `MessageEvent`s, so QQ shares the same session store, commands,
+model switching, toolsets, media delivery, hooks, memory, and transcript logic as
+Telegram, Discord, Weixin, and other built-in Hermes messaging platforms.
+
+## Why this exists
+
+A standalone QQ bridge that starts isolated CLI turns creates hard-to-debug
+behavior:
+
+- model switches in config or WebUI do not reliably affect QQ conversations;
+- `/new`, `/model`, `/reasoning`, `/stop`, `/reset` diverge from native channels;
+- image + follow-up text can race into separate turns;
+- progress/status messages can leak implementation details into QQ groups;
+- file/media delivery is duplicated outside Hermes' normal delivery path.
+
+This plugin keeps QQ as a thin transport adapter and leaves the actual AI/session
+behavior in Hermes core.
+
+## Current status
+
+- Personal QQ via NapCat / OneBot 11: supported.
+- Private chat: supported.
+- Group chat: supported, including allowlists and optional respond-to-all mode.
+- Text, image, voice/audio, video, document/file receive: supported where NapCat
+  exposes usable URLs or file metadata.
+- Text, image, voice/audio, video, document/file send: supported through OneBot
+  send APIs and NapCat file upload helpers.
+- Official QQ Bot API: **not** this plugin.  Keep using Hermes `qqbot` for that.
+
+## Repository layout
+
+```text
+hermes_qq/
+  adapter.py      # Hermes BasePlatformAdapter implementation
+  client.py       # NapCat/OneBot HTTP RPC client
+  types.py        # shared dataclasses
+
+gateway_platform_shim/
+  qq.py           # copied to Hermes gateway/platforms/qq.py
+
+scripts/
+  install-native-qq.sh      # install package + shim + Hermes core patch
+  patch_hermes_core.py      # idempotent core patcher
+
+examples/
+  config.qq.yaml            # config.yaml snippet
+
+docs/
+  architecture.md           # design rationale
+  hermes-core-changes.md    # exact Hermes core integration points
+```
+
+## Prerequisites
+
+1. A working Hermes checkout, usually:
+
+   ```bash
+   /home/USER/.hermes/hermes-agent
+   ```
+
+2. Hermes virtualenv installed:
+
+   ```bash
+   ~/.hermes/hermes-agent/venv/bin/python
+   ```
+
+3. NapCat running with OneBot HTTP + WebSocket enabled.  Example endpoints:
+
+   - HTTP: `http://127.0.0.1:3000`
+   - WebSocket: `ws://127.0.0.1:3001`
+
+4. A NapCat token if your NapCat instance requires one.
+
+## Install
+
+Clone this repository and run the installer against your Hermes checkout:
 
 ```bash
-# 1) 安装 Hermes Agent
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
-source ~/.bashrc  # 或 source ~/.zshrc
-
-# 2) 下载并安装本插件
 git clone https://github.com/zhuguadundan/hermes-qq-plugin.git
 cd hermes-qq-plugin
-bash scripts/install-plugin.sh
-
-# 3) 配置 NapCat / OneBot / QQ 白名单
-# install-plugin.sh 会自动生成 ~/.hermes/napcat_qq_bridge/config.json
-$EDITOR ~/.hermes/napcat_qq_bridge/config.json
-
-# 4) 启动 QQ 个人号桥接
-hermes napcat-qq-bridge run
-
-# 5) 健康检查
-curl http://127.0.0.1:8096/healthz
+./scripts/install-native-qq.sh ~/.hermes/hermes-agent
 ```
 
-Systemd 用户服务示例：
+The installer does three things:
+
+1. installs this package into Hermes' virtualenv with `pip install -e`;
+2. copies `gateway_platform_shim/qq.py` to Hermes as `gateway/platforms/qq.py`;
+3. applies the minimal Hermes core patch needed to discover and load
+   `platforms.qq`.
+
+Then restart Hermes Gateway:
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp examples/systemd/hermes-napcat-qq-bridge.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now hermes-napcat-qq-bridge.service
-systemctl --user status hermes-napcat-qq-bridge.service
+systemctl --user restart hermes-gateway.service
+systemctl --user status hermes-gateway.service --no-pager
 ```
 
----
-
-## 这个插件解决什么问题？
-
-Hermes 已经有官方 `qqbot` 平台，但 `qqbot` 面向腾讯官方 Bot API。很多个人场景，尤其是**家庭群助手**，更需要“一个正常 QQ 个人号”进入群聊：
-
-- 家庭群里直接 @ 它问事、记事、查资料；
-- 不需要把家人迁移到新平台；
-- 群聊上下文可以共享，适合连续对话；
-- 私聊也能作为自己的随身 Hermes 入口。
-
-所以本仓库的语义是：
-
-- **QQ Personal**：本插件，NapCat / OneBot / QQ 个人号桥接；
-- **QQBot API**：Hermes 官方 `qqbot` 平台，腾讯官方 Bot API。
-
-二者应该被明确区分，避免 Hermes 把个人号桥接和官方 QQ Bot 混在一起。
-
----
-
-## 功能能力
-
-当前版本已对齐 Hermes 原生消息平台的主要流程：
-
-- NapCat OneBot **WebSocket 入站**；
-- NapCat OneBot **HTTP API 出站**；
-- QQ 私聊、QQ群聊；
-- 文本、图片、语音、视频、普通文件、在线文件；
-- 每个聊天绑定 Hermes session，自动 `--resume`；
-- 处理中收到 follow-up 时，可中断当前轮次并合并新消息；
-- 群聊 session 可选：
-  - `group_sessions_per_user: true`：按群成员隔离；
-  - `group_sessions_per_user: false`：整群共享一个上下文；
-- 支持桥接本地命令：
-  - `/new`
-  - `/reset`
-  - `/status`
-  - `/stop`
-  - `/help`
-- 支持 Hermes slash 命令透传：
-  - `/reasoning`
-  - `/model`
-  - `/fast`
-  - `/usage`
-  - `/compress`
-  - 以及其他 Hermes 已注册命令；
-- `/new`、`/reset`、`/model`、`/reasoning`、`/fast` 会显示模型信息块，例如：
-
-```text
-◆ Model: gpt-5.5
-◆ Provider: custom
-◆ Context: 200K tokens 配置
-```
-
----
-
-## 仓库结构
-
-```text
-.
-├── README.md
-├── examples/
-│   ├── docker-compose.napcat.yml
-│   └── systemd/hermes-napcat-qq-bridge.service
-├── napcat_qq_bridge/
-│   ├── __init__.py
-│   ├── bridge.py
-│   ├── cli.py
-│   ├── config.example.json
-│   ├── plugin.yaml
-│   └── README.md
-├── scripts/install-plugin.sh
-└── tests/test_napcat_qq_bridge.py
-```
-
----
-
-## 安装前准备
-
-你需要先准备：
-
-1. Hermes Agent 已安装并能正常运行；
-2. NapCat 已登录 QQ；
-3. NapCat 已开启 OneBot HTTP API 和 WebSocket Server；
-4. 知道你的 QQ 号、要接入的群号。
-
-建议先确认 Hermes 本体能正常对话：
+If you do not use systemd, restart whatever command runs:
 
 ```bash
-hermes
+python -m hermes_cli.main gateway run --replace
 ```
 
----
+## Configure Hermes
 
-## 配置文件
+Merge `examples/config.qq.yaml` into `~/.hermes/config.yaml`.
 
-默认配置路径：
-
-```text
-~/.hermes/napcat_qq_bridge/config.json
-```
-
-`bash scripts/install-plugin.sh` 会从 `napcat_qq_bridge/config.example.json` 生成这个文件，并自动把示例里的 `/home/YOUR_USER` 替换为当前用户的 `$HOME`。
-
-最重要的是下面几段：
-
-```json
-{
-  "onebot": {
-    "url": "http://127.0.0.1:3000",
-    "token": "YOUR_TOKEN",
-    "ws_url": "ws://127.0.0.1:3001",
-    "ws_token": "YOUR_TOKEN"
-  },
-  "bridge": {
-    "host": "127.0.0.1",
-    "port": 8096,
-    "receive_mode": "ws",
-    "group_chat_all": false,
-    "group_sessions_per_user": false,
-    "enable_online_file": true,
-    "auto_approve_dangerous_commands": false
-  },
-  "auth": {
-    "private_users": ["你的QQ号"],
-    "group_ids": ["家庭群号"],
-    "group_users": []
-  },
-  "hermes": {
-    "bin": "hermes",
-    "workdir": "/home/你的用户名",
-    "model": "",
-    "provider": "",
-    "toolsets": "terminal,file,web",
-    "skills": []
-  }
-}
-```
-
-### 家庭群助手推荐配置
-
-如果你希望一个家庭群共享同一段上下文，推荐：
-
-```json
-"group_chat_all": false,
-"group_sessions_per_user": false
-```
-
-含义：
-
-- `group_chat_all: false`：默认只响应 @机器人 或回复机器人，避免群里所有闲聊都触发；
-- `group_sessions_per_user: false`：同一个群共享一个 Hermes session，适合家庭助手连续对话。
-
-如果你希望群里每个人都有独立上下文，把 `group_sessions_per_user` 改成 `true`。
-
----
-
-## 启动方式
-
-前台启动：
-
-```bash
-hermes napcat-qq-bridge run
-```
-
-指定配置文件：
-
-```bash
-hermes napcat-qq-bridge run --config-file ~/.hermes/napcat_qq_bridge/config.json
-```
-
-Systemd 后台运行见：
-
-```text
-examples/systemd/hermes-napcat-qq-bridge.service
-```
-
----
-
-## 健康检查
-
-```bash
-curl http://127.0.0.1:8096/healthz
-```
-
-重点看这些字段：
-
-- `ok: true`
-- `websocket_connected: true`
-- `bot_user_id`
-- `bot_name`
-- `allowed_private_users`
-- `allowed_groups`
-- `group_chat_all`
-- `group_sessions_per_user`
-- `enable_online_file`
-- `auto_approve_dangerous_commands`
-
----
-
-## 常用 QQ 命令
-
-桥接本地命令：
-
-```text
-/new      重置当前聊天 session，并显示模型 / provider / context
-/reset    同 /new
-/status   查看桥接状态
-/stop     停止当前处理中任务
-/help     查看帮助
-```
-
-Hermes 命令透传示例：
-
-```text
-/reasoning
-/reasoning high
-/reasoning xhigh
-/model
-/model gpt-5.5
-/fast
-/usage
-/compress
-```
-
-注意：QQ 里没有 Hermes TUI 的交互式选择器，所以 `/model` 不会打开选择菜单；请使用 `/model <模型名>`。
-
----
-
-## 媒体回发
-
-Hermes 最终回复里包含下面格式时，桥会把文件回发到 QQ：
-
-```text
-MEDIA:/absolute/path/to/file.png
-```
-
-音频按 QQ 语音发送：
-
-```text
-[[audio_as_voice]]
-MEDIA:/absolute/path/to/audio.ogg
-```
-
----
-
-## 对 Hermes 本体需要什么改动？
-
-### 最小运行：不需要改 Hermes 本体源码
-
-只要 Hermes CLI 正常可用，本插件可以通过结构化调用运行 Hermes，并把结果发回 QQ。
-
-### 推荐增强：让 Web UI / status 也识别 QQ Personal
-
-如果你希望 Hermes Web UI 和状态页里明确显示 **QQ Personal**，并和官方 **QQBot API** 分开，需要在 Hermes 本体做集成增强。改动方向如下：
-
-1. `gateway/config.py`
-   - 增加 `platforms.qq` / `QQ Personal` 的独立识别；
-   - 保留 `platforms.qqbot` 给官方 QQ Bot API；
-   - 可显式配置 `platforms.qqbot.enabled: false`，避免误启官方 QQ Bot。
-2. `hermes_cli/gateway.py`
-   - 增加 QQ Personal bridge 的 setup / runtime status helper；
-   - 能读取 systemd / healthz 状态。
-3. `hermes_cli/status.py`
-   - 分开展示 `QQ Personal` 和 `QQBot API`。
-4. `hermes_cli/web_server.py`
-   - `/api/status` 注入 `qq_personal` 状态。
-5. Web UI 前端
-   - platform card / sessions / alert 里渲染 `QQ Personal`。
-
-这些增强不是本插件启动的硬依赖，但能让体验更接近 Hermes 原生消息平台。
-
----
-
-## 与官方 QQ Bot 的区分建议
-
-推荐 Hermes 配置中这样表达：
+Minimal private-chat config:
 
 ```yaml
 platforms:
-  qqbot:
-    enabled: false   # 官方腾讯 QQ Bot API，不使用就关掉
   qq:
-    enabled: true    # QQ Personal / NapCat / OneBot / 个人号
+    enabled: true
+    extra:
+      onebot_url: http://127.0.0.1:3000
+      onebot_token: YOUR_NAPCAT_TOKEN
+      onebot_ws_url: ws://127.0.0.1:3001
+      onebot_ws_token: YOUR_NAPCAT_TOKEN
+      dm_policy: allowlist
+      allow_from:
+        - '123456789'
+      group_policy: disabled
+
+  qqbot:
+    enabled: false
 ```
 
-本插件自身仍通过 `~/.hermes/napcat_qq_bridge/config.json` 运行；上面的 Hermes 配置主要用于 Web UI / status / setup 层面的区分展示。
+Group config:
 
----
+```yaml
+platforms:
+  qq:
+    enabled: true
+    extra:
+      onebot_url: http://127.0.0.1:3000
+      onebot_token: YOUR_NAPCAT_TOKEN
+      onebot_ws_url: ws://127.0.0.1:3001
+      onebot_ws_token: YOUR_NAPCAT_TOKEN
+      group_policy: allowlist
+      group_allow_from:
+        - '987654321'
+      group_chat_all: true
+      group_sessions_per_user: false
+    home_channel:
+      platform: qq
+      chat_id: group:987654321
+      name: QQ group 987654321
 
-## 开发与测试
+  qqbot:
+    enabled: false
+```
+
+Recommended display defaults for QQ:
+
+```yaml
+display:
+  platforms:
+    qq:
+      tool_progress: off
+      streaming: false
+      interim_assistant_messages: false
+      show_reasoning: false
+```
+
+QQ cannot edit messages, so permanent progress/interim bubbles are intentionally
+quiet by default.  Necessary user-facing command replies still go to chat.
+
+## NapCat / OneBot setup checklist
+
+In NapCat, enable:
+
+- OneBot HTTP server;
+- OneBot WebSocket server;
+- the same access token configured in Hermes;
+- image/file access or download URLs if you want media receive;
+- file upload APIs if you want Hermes to send documents/files.
+
+Then verify:
 
 ```bash
-python -m py_compile napcat_qq_bridge/bridge.py
-python -m pytest -q tests/test_napcat_qq_bridge.py
+curl -H 'Authorization: Bearer YOUR_NAPCAT_TOKEN' \
+  http://127.0.0.1:3000/get_login_info
 ```
 
-当前测试覆盖：
+## Commands
 
-- OneBot 消息解析；
-- 私聊 / 群聊触发；
-- session reset；
-- follow-up 合并；
-- 文件 / 图片 / 语音 / 在线文件处理；
-- `/new` 模型信息输出；
-- Hermes slash 命令透传。
+Once installed as a native platform, QQ uses Hermes Gateway commands:
 
----
+- `/new` or `/reset` — reset the current QQ session;
+- `/model` / `/model MODEL_NAME` — inspect or switch model;
+- `/reasoning` / `/reasoning high` — inspect or change reasoning effort;
+- `/stop` — stop current run;
+- `/status` — status;
+- `/help` — help.
 
-## 安全提醒
+Model changes in Hermes config or WebUI should apply to QQ because QQ is no
+longer an isolated CLI bridge.
 
-- 不要公开你的 NapCat token；
-- 不要把个人 QQ 号部署在不可信机器上；
-- 默认建议使用 allowlist；
-- `auto_approve_dangerous_commands: true` 等同于 QQ 会话里自动批准危险命令，只建议在完全可信环境里开启。
+## What changes are required in Hermes core?
 
----
+Hermes does not yet expose a stable external platform-adapter registry, so this
+plugin currently requires a small core patch.  See:
+
+- [`docs/hermes-core-changes.md`](docs/hermes-core-changes.md)
+- [`scripts/patch_hermes_core.py`](scripts/patch_hermes_core.py)
+
+Summary:
+
+- add `Platform.QQ = "qq"`;
+- load `NapCatQQAdapter` in `GatewayRunner._create_adapter()`;
+- register QQ allowlist env vars;
+- add `qq` to CLI platform metadata;
+- add `hermes-qq` toolset;
+- install `gateway/platforms/qq.py` shim;
+- set low-noise display defaults for QQ.
+
+The preferred long-term Hermes change is an official external adapter entrypoint
+such as Python entry points (`hermes.gateway_platforms`).  When Hermes supports
+that, this repository can stop patching core files.
+
+## Troubleshooting
+
+### Gateway does not load QQ
+
+Check:
+
+```bash
+grep -n "QQ =" ~/.hermes/hermes-agent/gateway/config.py
+ls ~/.hermes/hermes-agent/gateway/platforms/qq.py
+~/.hermes/hermes-agent/venv/bin/python -c 'import hermes_qq; print(hermes_qq.NapCatQQAdapter)'
+```
+
+Then restart gateway.
+
+### QQ messages do not trigger replies
+
+Check allowlists:
+
+- private chats: `platforms.qq.extra.allow_from`
+- groups: `platforms.qq.extra.group_allow_from`
+- `group_chat_all`; if false, bot only responds when mentioned.
+
+### Files do not send
+
+File sending depends on NapCat file APIs.  Verify the bot account can upload
+files in that chat and that NapCat exposes `upload_file_stream`,
+`upload_group_file`, and/or `send_online_file`.
+
+### Seeing internal status in QQ groups
+
+QQ cannot edit messages, so use:
+
+```yaml
+display:
+  platforms:
+    qq:
+      tool_progress: off
+      streaming: false
+      interim_assistant_messages: false
+```
+
+This hides noisy progress bubbles while preserving meaningful command replies.
+
+## Development
+
+Run lightweight tests:
+
+```bash
+python -m pytest -q
+```
+
+When developing inside a Hermes checkout, also run Hermes gateway tests that
+cover native QQ behavior.
 
 ## License
 
-见 `LICENSE`。
+MIT

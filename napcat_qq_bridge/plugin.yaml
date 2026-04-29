@@ -1,7 +1,0 @@
-name: napcat_qq_bridge
-version: 0.1.0
-description: Receive QQ messages from NapCat and relay them to Hermes; send text/images/voice/files back to QQ.
-author: Hermes Agent
-provides_hooks: []
-provides_tools: []
-requires_env: []

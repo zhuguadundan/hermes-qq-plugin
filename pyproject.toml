@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-qq-plugin"
+version = "0.1.0"
+description = "Native NapCat/OneBot personal QQ platform adapter for Hermes Gateway"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "zhuguadundan" }]
+dependencies = [
+  "requests>=2.31",
+  "websockets>=11",
+]
+
+[project.urls]
+Homepage = "https://github.com/zhuguadundan/hermes-qq-plugin"
+Repository = "https://github.com/zhuguadundan/hermes-qq-plugin"
+
+[tool.setuptools.packages.find]
+include = ["hermes_qq*"]

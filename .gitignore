@@ -1,12 +1,9 @@
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
 .venv/
 venv/
-.DS_Store
-napcat_qq_bridge/config.json
-napcat_qq_bridge/bridge.runtime.log
+dist/
+build/
+*.egg-info/
+.env
