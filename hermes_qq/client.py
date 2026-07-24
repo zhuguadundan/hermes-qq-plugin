@@ -65,6 +65,9 @@ class NapCatClient:
     def get_login_info(self) -> dict:
         return self.call("get_login_info").get("data", {})
 
+    def get_status(self) -> dict:
+        return self.call("get_status").get("data", {})
+
     def get_message(self, message_id: str) -> dict:
         return self.call("get_msg", {"message_id": message_id}).get("data", {})
 

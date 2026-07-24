@@ -1,39 +1,113 @@
-# Hermes core changes required by this plugin
+# Hermes Core 集成说明
 
-Hermes currently does not expose a stable third-party platform-adapter registry.
-For that reason a native QQ plugin needs a small Hermes core patch so the gateway
-can discover `platforms.qq` and instantiate `NapCatQQAdapter`.
+## 为什么需要修改 Hermes
 
-The installer applies these changes idempotently:
+当前 Hermes 没有稳定的第三方 Gateway platform entrypoint。仅安装 `hermes_qq` Python 包还不足以让 Gateway 识别 `platforms.qq`，因此本仓库提供：
 
-1. `gateway/config.py`
-   - add `Platform.QQ = "qq"`
-   - mark `platforms.qq.extra.onebot_url` / `onebot_ws_url` as a connected platform
-   - keep official `qqbot` separate from personal QQ/NapCat
+- `gateway_platform_shim/qq.py`
+- `scripts/patch_hermes_core.py`
+- `scripts/install-native-qq.sh`
 
-2. `gateway/run.py`
-   - create `NapCatQQAdapter` when `Platform.QQ` is enabled
-   - map QQ allowlist environment variables:
-     - `QQ_ALLOWED_USERS`
-     - `QQ_GROUP_ALLOWED_USERS`
-     - `QQ_ALLOW_ALL_USERS`
+安装脚本先 editable 安装插件、复制 shim，再执行 core patcher。
 
-3. `gateway/platforms/qq.py`
-   - shim import that loads `hermes_qq.NapCatQQAdapter`
+## patcher 期望的改动
 
-4. `gateway/platforms/__init__.py`
-   - export `NapCatQQAdapter`
+### `gateway/config.py`
 
-5. `hermes_cli/platforms.py`
-   - register `qq` as `QQ Personal` with default toolset `hermes-qq`
+- 增加 `Platform.QQ = "qq"`；
+- 当 `platforms.qq.extra` 中存在 OneBot HTTP 或 WebSocket 地址时，将个人 QQ 识别为已配置平台；
+- 保持个人 QQ `qq` 与腾讯官方机器人 `qqbot` 分离。
 
-6. `toolsets.py`
-   - add the `hermes-qq` toolset
-   - include it in the aggregate `hermes-gateway` toolset
+### `gateway/run.py`
 
-7. `gateway/display_config.py` when available
-   - treat QQ like other non-editable platforms: low-noise defaults
+- 为 `Platform.QQ` 创建 `NapCatQQAdapter`；
+- 增加 QQ 私聊、群聊和 allow-all 环境变量映射：
+  - `QQ_ALLOWED_USERS`
+  - `QQ_GROUP_ALLOWED_USERS`
+  - `QQ_ALLOW_ALL_USERS`
 
-Recommended upstream direction: Hermes should eventually provide a stable
-external platform adapter entrypoint, e.g. Python entry points such as
-`hermes.gateway_platforms`, so this patch layer can disappear.
+### `gateway/platforms/qq.py`
+
+从外部包导入：
+
+```python
+from hermes_qq import NapCatQQAdapter, check_qq_requirements
+```
+
+### `gateway/platforms/__init__.py`
+
+导出 `NapCatQQAdapter`。
+
+### `hermes_cli/platforms.py`
+
+注册 `qq`，显示为个人 QQ 平台，并使用 `hermes-qq` toolset。
+
+### `toolsets.py`
+
+- 注册 `hermes-qq` toolset；
+- 将它加入 Gateway 聚合 toolset。
+
+### `gateway/display_config.py`
+
+在文件存在且标记匹配时，将 QQ 配置为不可编辑消息平台的低噪音默认策略。
+
+## 幂等性和限制
+
+`patch_hermes_core.py` 使用保守的文本标记替换：
+
+- 已存在的改动会显示 `ok`，不会重复插入；
+- 找不到标记会显示 `warn: marker not found`；
+- 找不到标记时脚本不会猜测 Hermes 新版本结构，也不会盲目覆盖文件。
+
+因此，`warn` 不是成功。Hermes 升级后必须检查安装输出，并确认上述集成点仍然存在。
+
+## 安装后验证
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python -c \
+  'import hermes_qq; print(hermes_qq.__file__)'
+
+grep -n 'QQ = "qq"' ~/.hermes/hermes-agent/gateway/config.py
+grep -n 'NapCatQQAdapter' ~/.hermes/hermes-agent/gateway/run.py
+ls -l ~/.hermes/hermes-agent/gateway/platforms/qq.py
+```
+
+运行测试：
+
+```bash
+cd ~/hermes-qq-plugin
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q
+
+cd ~/.hermes/hermes-agent
+venv/bin/python -m pytest -q tests/gateway/test_native_qq_adapter.py
+```
+
+重启并检查日志：
+
+```bash
+systemctl --user restart hermes-gateway.service
+systemctl --user status hermes-gateway.service --no-pager
+tail -n 200 ~/.hermes/logs/agent.log | grep -E 'QQ|NapCat|WebSocket'
+```
+
+成功启动通常能看到：
+
+```text
+[QQ] Connected to NapCat as ...
+[QQ] WebSocket connected: ...
+```
+
+## Hermes 升级后的处理
+
+1. 先备份 Hermes 主仓库中的未提交修改和 `~/.hermes/config.yaml`。
+2. 完成 Hermes 升级。
+3. 重新运行 `./scripts/install-native-qq.sh ~/.hermes/hermes-agent`。
+4. 检查是否出现 `warn: marker not found`。
+5. 运行插件测试和 Hermes QQ 集成测试。
+6. 重启 Gateway 并观察 QQ 连接日志。
+
+不要用本仓库覆盖 Hermes 主仓库中的其他本地修改。本仓库只负责 QQ plugin 及其明确列出的集成点。
+
+## 长期方向
+
+如果 Hermes 将来提供类似 Python entry points 的正式接口，例如 `hermes.gateway_platforms`，本插件应迁移到该接口，并删除 core 文本 patch 层。

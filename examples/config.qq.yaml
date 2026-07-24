@@ -22,11 +22,22 @@ platforms:
       group_chat_all: true          # true = respond to all group messages in allowed groups
       group_sessions_per_user: false
 
-      # Media/runtime options.
+      # Media and event batching.
       request_timeout: 60
       chunk_size: 65536
       enable_online_file: true
       batch_delay_seconds: 1.2      # merge image + follow-up text events
+      split_batch_delay_seconds: 2.5
+      split_threshold: 1800
+
+      # WebSocket recovery and recent-message backfill.
+      # Backfill only queries explicit private/group allowlist targets.
+      history_backfill_count: 20
+      history_backfill_seconds: 600
+      ws_reconnect_delay_seconds: 3
+      ws_ping_interval_seconds: 25
+      ws_ping_timeout_seconds: 15
+      health_check_interval_seconds: 15
 
     # Optional home channel for cron/cross-platform delivery.
     home_channel:

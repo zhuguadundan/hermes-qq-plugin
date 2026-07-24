@@ -85,6 +85,14 @@ class NapCatQQAdapter(BasePlatformAdapter):
         self.group_chat_all = bool(extra.get("group_chat_all", False))
         self.enable_online_file = bool(extra.get("enable_online_file", True))
         self.history_backfill_count = int(extra.get("history_backfill_count") or 20)
+        self.history_backfill_seconds = int(extra.get("history_backfill_seconds") or 600)
+        self.resync_interval_seconds = float(extra.get("resync_interval_seconds") or 3)
+        self._ws_reconnect_delay_seconds = float(extra.get("ws_reconnect_delay_seconds") or 3)
+        self._ws_ping_interval_seconds = float(extra.get("ws_ping_interval_seconds") or 25)
+        self._ws_ping_timeout_seconds = float(extra.get("ws_ping_timeout_seconds") or 15)
+        self._health_check_interval_seconds = float(
+            extra.get("health_check_interval_seconds") or max(15.0, self.resync_interval_seconds)
+        )
         self._dm_policy = str(extra.get("dm_policy", "open")).lower()
         self._group_policy = str(extra.get("group_policy", "open")).lower()
         self._allow_from = _coerce_list(extra.get("allow_from") or extra.get("allowFrom"))
@@ -99,6 +107,10 @@ class NapCatQQAdapter(BasePlatformAdapter):
         self._split_threshold = int(extra.get("split_threshold") or 1800)
         self._client = NapCatClient(self.onebot_url, self.onebot_token, self.request_timeout, self.chunk_size)
         self._listen_task: Optional[asyncio.Task] = None
+        self._health_task: Optional[asyncio.Task] = None
+        # Connection state and desired lifecycle are separate so a transient
+        # WebSocket failure does not terminate the reconnect loop.
+        self._qq_should_run = False
         self.bot_user_id = ""
         self.bot_name = "Hermes"
 
@@ -111,8 +123,9 @@ class NapCatQQAdapter(BasePlatformAdapter):
             login = await asyncio.to_thread(self._client.get_login_info)
             self.bot_user_id = str(login.get("user_id") or "")
             self.bot_name = str(login.get("nickname") or self.bot_user_id or "Hermes")
-            self._running = True
+            self._qq_should_run = True
             self._listen_task = asyncio.create_task(self._listen_loop())
+            self._health_task = asyncio.create_task(self._health_loop())
             self._mark_connected()
             logger.info("[QQ] Connected to NapCat as %s (%s)", self.bot_name, self.bot_user_id)
             return True
@@ -123,15 +136,18 @@ class NapCatQQAdapter(BasePlatformAdapter):
             return False
 
     async def disconnect(self) -> None:
-        self._running = False
+        self._qq_should_run = False
         self._mark_disconnected()
-        if self._listen_task:
-            self._listen_task.cancel()
+        for task in (self._listen_task, self._health_task):
+            if not task:
+                continue
+            task.cancel()
             try:
-                await self._listen_task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._listen_task = None
+        self._listen_task = None
+        self._health_task = None
         for task in list(self._pending_batch_tasks.values()):
             if not task.done():
                 task.cancel()
@@ -304,8 +320,17 @@ class NapCatQQAdapter(BasePlatformAdapter):
             return str(path)
 
     @staticmethod
-    def _websocket_connect_kwargs(headers: Optional[Dict[str, str]]) -> Dict[str, Any]:
-        kwargs: Dict[str, Any] = {"ping_interval": None, "max_size": 2 * 1024 * 1024}
+    def _websocket_connect_kwargs(
+        headers: Optional[Dict[str, str]],
+        *,
+        ping_interval: float = 25.0,
+        ping_timeout: float = 15.0,
+    ) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            "ping_interval": ping_interval,
+            "ping_timeout": ping_timeout,
+            "max_size": 2 * 1024 * 1024,
+        }
         if not headers:
             return kwargs
         try:
@@ -327,31 +352,140 @@ class NapCatQQAdapter(BasePlatformAdapter):
         return QQEventSource(user_id=user_id, group_id=None, message_id=None, self_id=self.bot_user_id, raw={})
 
     async def _listen_loop(self) -> None:
-        while self._running:
+        while self._qq_should_run:
             try:
                 headers = {"Authorization": f"Bearer {self.onebot_ws_token}"} if self.onebot_ws_token else None
                 ws_ctx = websockets.connect(
                     self.onebot_ws_url,
-                    **self._websocket_connect_kwargs(headers),
+                    **self._websocket_connect_kwargs(
+                        headers,
+                        ping_interval=self._ws_ping_interval_seconds,
+                        ping_timeout=self._ws_ping_timeout_seconds,
+                    ),
                 )
                 async with ws_ctx as ws:
                     self._mark_connected()
                     logger.info("[QQ] WebSocket connected: %s", self.onebot_ws_url)
+                    await self._backfill_recent_messages()
                     async for payload in ws:
-                        if not self._running:
+                        if not self._qq_should_run:
                             break
                         try:
                             event = json.loads(payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else str(payload))
                         except Exception:
                             continue
-                        await self._handle_onebot_event(event, origin="ws")
+                        try:
+                            await self._handle_onebot_event(event, origin="ws")
+                        except Exception as event_exc:
+                            logger.warning("[QQ] Failed to process OneBot event: %s", event_exc, exc_info=True)
+                    if self._qq_should_run:
+                        raise RuntimeError("WebSocket closed")
             except asyncio.CancelledError:
-                raise
+                return
             except Exception as exc:
-                if self._running:
-                    self._mark_disconnected()
-                    logger.warning("[QQ] WebSocket error: %s; reconnecting in 3s", exc)
-                    await asyncio.sleep(3)
+                if self._qq_should_run:
+                    self._mark_stream_disconnected()
+                    logger.warning(
+                        "[QQ] WebSocket error: %s; reconnecting in %ss",
+                        exc,
+                        self._ws_reconnect_delay_seconds,
+                    )
+                    await asyncio.sleep(self._ws_reconnect_delay_seconds)
+
+    def _mark_stream_disconnected(self) -> None:
+        self._running = False
+        try:
+            from gateway.status import write_runtime_status
+
+            write_runtime_status(
+                platform=self.platform.value,
+                platform_state="disconnected",
+                error_code=None,
+                error_message=None,
+            )
+        except Exception:
+            pass
+
+    async def _health_loop(self) -> None:
+        try:
+            while self._qq_should_run:
+                await asyncio.sleep(self._health_check_interval_seconds)
+                if not self._qq_should_run:
+                    return
+                try:
+                    status = await asyncio.to_thread(self._client.get_status)
+                    if isinstance(status, dict) and status.get("online") is False:
+                        logger.warning("[QQ] NapCat reports account offline: %s", status)
+                except Exception as exc:
+                    logger.warning("[QQ] NapCat health check failed: %s", exc)
+        except asyncio.CancelledError:
+            return
+
+    async def _backfill_recent_messages(self) -> None:
+        if self.history_backfill_count <= 0 or self.history_backfill_seconds <= 0:
+            return
+        cutoff = time.time() - self.history_backfill_seconds
+        for chat_type, target_id in self._backfill_targets():
+            try:
+                if chat_type == "group":
+                    messages = await asyncio.to_thread(
+                        self._client.get_group_msg_history,
+                        target_id,
+                        self.history_backfill_count,
+                    )
+                else:
+                    messages = await asyncio.to_thread(
+                        self._client.get_friend_msg_history,
+                        target_id,
+                        self.history_backfill_count,
+                    )
+            except Exception as exc:
+                logger.debug("[QQ] History backfill failed for %s:%s: %s", chat_type, target_id, exc)
+                continue
+
+            if not isinstance(messages, list):
+                continue
+            recent = (message for message in messages if isinstance(message, dict))
+            for raw in sorted(recent, key=self._event_timestamp):
+                timestamp = self._event_timestamp(raw)
+                if timestamp and timestamp < cutoff:
+                    continue
+                event = self._history_event_to_onebot(raw, chat_type, target_id)
+                try:
+                    await self._handle_onebot_event(event, origin="backfill")
+                except Exception as exc:
+                    logger.debug("[QQ] History backfill event skipped: %s", exc)
+
+    def _backfill_targets(self) -> List[Tuple[str, str]]:
+        targets: List[Tuple[str, str]] = []
+        if self._dm_policy == "allowlist":
+            targets.extend(("private", value) for value in self._allow_from if value != "*")
+        if self._group_policy == "allowlist":
+            targets.extend(("group", value) for value in self._group_allow_from if value != "*")
+        return targets
+
+    @staticmethod
+    def _event_timestamp(event: dict, default: float = 0) -> float:
+        try:
+            return float(event.get("time") or default)
+        except (TypeError, ValueError):
+            return default
+
+    def _history_event_to_onebot(self, raw: dict, chat_type: str, target_id: str) -> dict:
+        event = dict(raw)
+        event.setdefault("post_type", "message")
+        event.setdefault("message_type", "group" if chat_type == "group" else "private")
+        event.setdefault("self_id", self.bot_user_id)
+        if chat_type == "group":
+            event.setdefault("group_id", target_id)
+        else:
+            event.setdefault("user_id", target_id)
+        sender = event.get("sender")
+        if isinstance(sender, dict) and not event.get("user_id"):
+            event["user_id"] = sender.get("user_id")
+        if "message" not in event:
+            event["message"] = event.get("raw_message") or ""
+        return event
 
     async def _handle_onebot_event(self, event: dict, origin: str = "ws") -> None:
         normalized = self._normalize_event(event)
@@ -386,7 +520,7 @@ class NapCatQQAdapter(BasePlatformAdapter):
             message_id=source.message_id,
             media_urls=media_urls,
             media_types=media_types,
-            timestamp=datetime.fromtimestamp(float(normalized.get("time") or time.time())),
+            timestamp=datetime.fromtimestamp(self._event_timestamp(normalized, time.time())),
         )
         if event_obj.is_command():
             await self.handle_message(event_obj)
@@ -643,7 +777,8 @@ class NapCatQQAdapter(BasePlatformAdapter):
                 data = base64.b64decode(b64)
                 if prefix == "image":
                     return cache_image_from_bytes(data, ".jpg")
-                return cache_document_from_bytes(data, f"qq_{prefix}.bin")
+                suffix = ".mp3" if prefix == "audio" else ".bin"
+                return cache_document_from_bytes(data, f"qq_{prefix}{suffix}")
             except Exception:
                 pass
         return await self._download_first([meta.get("url"), meta.get("download_url"), meta.get("file"), meta.get("path")], prefix)

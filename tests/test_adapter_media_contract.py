@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from pathlib import Path
 
 from gateway.config import PlatformConfig
@@ -10,6 +11,8 @@ class FakeNapCatClient:
         self.uploads = []
         self.calls = []
         self.segments = []
+        self.group_history = []
+        self.friend_history = []
 
     def upload_file_stream(self, local_path: str) -> str:
         self.uploads.append(local_path)
@@ -26,6 +29,17 @@ class FakeNapCatClient:
     def send_text(self, source, text: str):
         self.calls.append(("send_text", {"source": source, "text": text}))
         return {"status": "ok", "data": {"message_id": 789}}
+
+    def get_status(self):
+        return {"online": True, "good": True}
+
+    def get_group_msg_history(self, group_id: str, count: int = 20):
+        self.calls.append(("get_group_msg_history", {"group_id": group_id, "count": count}))
+        return self.group_history[-count:]
+
+    def get_friend_msg_history(self, user_id: str, count: int = 20):
+        self.calls.append(("get_friend_msg_history", {"user_id": user_id, "count": count}))
+        return self.friend_history[-count:]
 
 
 def build_adapter() -> tuple[NapCatQQAdapter, FakeNapCatClient]:
@@ -130,3 +144,87 @@ def test_websocket_header_keyword_matches_installed_websockets_signature():
 
     assert kwargs[header_param] == {"Authorization": "Bearer token"}
     assert {"additional_headers", "extra_headers"}.intersection(kwargs) == {header_param}
+    assert kwargs["ping_interval"] > 0
+    assert kwargs["ping_timeout"] > 0
+
+
+def test_base64_record_is_cached_with_mp3_extension(monkeypatch):
+    adapter, fake = build_adapter()
+    fake.get_record = lambda file_key, out_format: {
+        "base64": base64.b64encode(b"fake mp3").decode("ascii")
+    }
+    monkeypatch.setattr(
+        "hermes_qq.adapter.cache_document_from_bytes",
+        lambda data, filename: f"/cache/{filename}",
+    )
+
+    path = asyncio.run(adapter._resolve_record({"file": "record-key"}))
+
+    assert path == "/cache/qq_audio.mp3"
+
+
+def test_stream_disconnect_does_not_stop_qq_adapter_reconnect_loop():
+    adapter, _fake = build_adapter()
+    adapter._qq_should_run = True
+    adapter._running = True
+
+    adapter._mark_stream_disconnected()
+
+    assert adapter._qq_should_run is True
+    assert adapter.is_connected is False
+
+
+def test_backfill_recent_group_messages_after_reconnect():
+    adapter, fake = build_adapter()
+    adapter.bot_user_id = "3860875399"
+    adapter._group_policy = "allowlist"
+    adapter._group_allow_from = ["20002"]
+    adapter.group_chat_all = True
+    adapter.history_backfill_count = 5
+    adapter.history_backfill_seconds = 600
+    adapter._batch_delay_seconds = 0
+    fake.group_history = [
+        {
+            "time": "not-a-number",
+            "message_id": "malformed-time",
+            "group_id": "20002",
+            "user_id": "10001",
+            "message": "",
+            "raw_message": "",
+        },
+        {
+            "time": 1,
+            "message_id": "old",
+            "group_id": "20002",
+            "user_id": "10001",
+            "message": "old",
+            "raw_message": "old",
+        },
+        {
+            "time": 9999999999,
+            "message_id": "new",
+            "group_id": "20002",
+            "user_id": "10001",
+            "message": "在吗",
+            "raw_message": "在吗",
+            "sender": {"user_id": "10001", "nickname": "tester"},
+        },
+    ]
+    handled = []
+
+    async def handle(event):
+        handled.append(event)
+        return None
+
+    adapter.set_message_handler(handle)
+
+    async def run_backfill():
+        await adapter._backfill_recent_messages()
+        await asyncio.sleep(0)
+        if adapter._background_tasks:
+            await asyncio.gather(*list(adapter._background_tasks))
+
+    asyncio.run(run_backfill())
+
+    assert [event.text for event in handled] == ["在吗"]
+    assert fake.calls == [("get_group_msg_history", {"group_id": "20002", "count": 5})]
