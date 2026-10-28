@@ -228,3 +228,135 @@ def test_backfill_recent_group_messages_after_reconnect():
 
     assert [event.text for event in handled] == ["在吗"]
     assert fake.calls == [("get_group_msg_history", {"group_id": "20002", "count": 5})]
+
+
+def _group_message(text: str, *, message_id: str, user: str = "10001", nickname: str = "tester", at_self: bool = False):
+    segments = []
+    if at_self:
+        segments.append({"type": "at", "data": {"qq": "3860875399"}})
+    segments.append({"type": "text", "data": {"text": text}})
+    return {
+        "post_type": "message",
+        "message_type": "group",
+        "self_id": "3860875399",
+        "group_id": "20002",
+        "user_id": user,
+        "message_id": message_id,
+        "time": 9999999999,
+        "message": segments,
+        "sender": {"user_id": user, "nickname": nickname},
+    }
+
+
+def _mention_only_adapter(listen_context: int):
+    adapter, fake = build_adapter()
+    adapter.bot_user_id = "3860875399"
+    adapter._group_policy = "open"
+    adapter.group_chat_all = False
+    adapter.group_listen_context = listen_context
+    adapter._batch_delay_seconds = 0
+    handled = []
+
+    async def handle(event):
+        # Stand-in for the gateway turn: proves whether a turn was triggered.
+        handled.append(event)
+
+    adapter.handle_message = handle  # type: ignore[method-assign]
+    return adapter, fake, handled
+
+
+def _feed(adapter, events):
+    async def go():
+        for event in events:
+            await adapter._handle_onebot_event(event)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    asyncio.run(go())
+
+
+def test_listen_mode_does_not_trigger_a_turn_for_plain_group_messages():
+    adapter, _fake, handled = _mention_only_adapter(listen_context=10)
+
+    _feed(
+        adapter,
+        [
+            _group_message("今天开会吗", message_id="m1", nickname="张三"),
+            _group_message("开，三点", message_id="m2", user="10002", nickname="李四"),
+        ],
+    )
+
+    assert handled == []
+    assert len(adapter._passive_backlog["20002"]) == 2
+
+
+def test_mention_prepends_context_then_clears_backlog():
+    adapter, _fake, handled = _mention_only_adapter(listen_context=10)
+
+    _feed(
+        adapter,
+        [
+            _group_message("今天开会吗", message_id="m1", nickname="张三"),
+            _group_message("开，三点", message_id="m2", user="10002", nickname="李四"),
+            _group_message("你在吗", message_id="m3", at_self=True),
+        ],
+    )
+
+    assert len(handled) == 1
+    text = handled[0].text
+    assert "张三: 今天开会吗" in text
+    assert "李四: 开，三点" in text
+    assert text.endswith("[当前消息] 你在吗")
+    assert adapter._passive_backlog.get("20002") is None
+
+    _feed(adapter, [_group_message("再来一次", message_id="m4", at_self=True)])
+    assert handled[1].text == "再来一次"
+
+
+def test_listen_backlog_respects_configured_window():
+    adapter, _fake, handled = _mention_only_adapter(listen_context=3)
+
+    _feed(
+        adapter,
+        [_group_message(f"第{i}条", message_id=f"m{i}", user="10001") for i in range(6)]
+        + [_group_message("在吗", message_id="m9", at_self=True)],
+    )
+
+    text = handled[0].text
+    assert "第0条" not in text
+    assert "第3条" in text and "第5条" in text
+    assert "共 3 条" in text
+
+
+def test_group_file_upload_is_recorded_without_reply_or_download():
+    adapter, fake, handled = _mention_only_adapter(listen_context=10)
+
+    upload = {
+        "post_type": "notice",
+        "notice_type": "group_upload",
+        "group_id": "20002",
+        "user_id": "10001",
+        "time": 9999999999,
+        "file": {"id": "f1", "name": "周报.pdf", "size": 1024},
+        "sender": {"user_id": "10001", "nickname": "张三"},
+    }
+    _feed(adapter, [upload])
+
+    assert handled == []
+    assert fake.calls == []  # no get_group_file_url / download attempt
+    assert "[文件] 周报.pdf" in "".join(adapter._passive_backlog["20002"])
+
+
+def test_listen_mode_keeps_slash_commands_working():
+    adapter, _fake, handled = _mention_only_adapter(listen_context=10)
+
+    _feed(
+        adapter,
+        [
+            _group_message("闲聊一句", message_id="m1"),
+            _group_message("/new", message_id="m2", at_self=True),
+        ],
+    )
+
+    assert [event.text for event in handled] == ["/new"]
+    assert handled[0].is_command()

@@ -21,6 +21,12 @@ platforms:
       # Group behavior.
       group_chat_all: true          # true = respond to all group messages in allowed groups
       group_sessions_per_user: false
+      # Mention-only mode with group awareness.  With group_chat_all: false the
+      # bot only answers @-mentions; group_listen_context: N keeps the last N
+      # non-mentioned messages in memory (no model call, no reply) and prepends
+      # them as read-only context when the bot is finally mentioned.
+      # 0 = pure mention-only with no group context.
+      group_listen_context: 0
 
       # Media and event batching.
       request_timeout: 60

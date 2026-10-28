@@ -17,9 +17,10 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import requests
 
@@ -83,6 +84,11 @@ class NapCatQQAdapter(BasePlatformAdapter):
         self.request_timeout = int(extra.get("request_timeout") or 60)
         self.chunk_size = int(extra.get("chunk_size") or 65536)
         self.group_chat_all = bool(extra.get("group_chat_all", False))
+        # Passive group backlog: number of recent non-mentioned group messages
+        # kept in memory and prepended as read-only context when the bot is
+        # finally mentioned.  0 disables listening entirely.
+        self.group_listen_context = max(0, int(extra.get("group_listen_context") or 0))
+        self._passive_backlog: Dict[str, Deque[str]] = {}
         self.enable_online_file = bool(extra.get("enable_online_file", True))
         self.history_backfill_count = int(extra.get("history_backfill_count") or 20)
         self.history_backfill_seconds = int(extra.get("history_backfill_seconds") or 600)
@@ -494,10 +500,12 @@ class NapCatQQAdapter(BasePlatformAdapter):
         source = self._build_qq_source(normalized)
         if not source.user_id or not self._is_allowed(source):
             return
-        if source.group_id and not await self._should_process_group_event(normalized, source):
-            return
+        addressed = not source.group_id or await self._should_process_group_event(normalized, source)
         dedupe = self._event_dedupe_key(normalized, source)
         if dedupe and not self._remember_event(dedupe):
+            return
+        if not addressed:
+            self._record_passive_group_event(normalized, source)
             return
 
         text, media_urls, media_types, msg_type = await self._build_message_parts(normalized, source)
@@ -505,6 +513,12 @@ class NapCatQQAdapter(BasePlatformAdapter):
             return
         chat_id = f"group:{source.group_id}" if source.group_id else f"private:{source.user_id}"
         sender = normalized.get("sender") or {}
+        if source.group_id and self.group_listen_context > 0 and msg_type != MessageType.COMMAND:
+            context = self._render_passive_context(str(source.group_id))
+            if context:
+                text = f"{context}\n[当前消息] {text}" if text else context
+                self._passive_backlog.pop(str(source.group_id), None)
+
         event_obj = MessageEvent(
             text=text,
             message_type=msg_type,
@@ -663,6 +677,70 @@ class NapCatQQAdapter(BasePlatformAdapter):
                 if qq and qq == str(source.self_id or self.bot_user_id):
                     return True
         return False
+
+    def _render_passive_context(self, group_id: str) -> str:
+        backlog = self._passive_backlog.get(group_id)
+        if not backlog:
+            return ""
+        lines: List[str] = []
+        budget = 1500
+        for line in reversed(list(backlog)):
+            if len(line) > budget:
+                break
+            lines.append(line)
+            budget -= len(line) + 1
+        if not lines:
+            return ""
+        lines.reverse()
+        header = f"[群聊上下文，共 {len(lines)} 条，仅供参考，不要逐条回复，也不要声称自己参与了这些发言]"
+        return "\n".join([header] + lines)
+
+    def _passive_summary(self, event: dict, source: QQEventSource) -> str:
+        parts: List[str] = []
+        for seg in self._message_segments(event):
+            typ = seg.get("type")
+            data = seg.get("data") or {}
+            if typ == "text":
+                parts.append(str(data.get("text") or ""))
+            elif typ == "at":
+                qq = str(data.get("qq") or "")
+                if qq and qq != str(source.self_id or self.bot_user_id):
+                    parts.append(f"@{qq}")
+            elif typ == "image":
+                parts.append("[图片]")
+            elif typ in ("record", "voice", "audio"):
+                parts.append("[语音]")
+            elif typ == "video":
+                parts.append("[视频]")
+            elif typ in ("file", "onlinefile"):
+                parts.append(f"[文件] {data.get('name') or '未命名文件'}")
+            elif typ == "face":
+                parts.append("[表情]")
+        body = re.sub(r"\s+", " ", "".join(parts)).strip()
+        return body[:200]
+
+    def _record_passive_group_event(self, event: dict, source: QQEventSource) -> None:
+        """Remember a group message that was not addressed to the bot.
+
+        Nothing is downloaded and no Hermes turn is created; the message only
+        becomes read-only context for a later mention.  Media is reduced to a
+        placeholder so the backlog stays cheap and PII-light.
+        """
+        if self.group_listen_context <= 0 or not source.group_id:
+            return
+        body = self._passive_summary(event, source)
+        if not body:
+            return
+        sender = event.get("sender") or {}
+        who = str(sender.get("card") or sender.get("nickname") or source.user_id or "?")
+        ts = self._event_timestamp(event, time.time())
+        stamp = datetime.fromtimestamp(ts).strftime("%H:%M")
+        line = f"{stamp} {who}: {body}"
+        backlog = self._passive_backlog.get(str(source.group_id))
+        if backlog is None:
+            backlog = deque(maxlen=self.group_listen_context)
+            self._passive_backlog[str(source.group_id)] = backlog
+        backlog.append(line)
 
     def _event_dedupe_key(self, event: dict, source: QQEventSource) -> Optional[str]:
         if source.message_id:
