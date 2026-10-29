@@ -13,6 +13,7 @@
 - 私聊白名单、群白名单、群成员白名单
 - 可选择响应群内全部消息或只响应 @ 机器人的消息
 - 只响应 @ 时仍可保留群聊上下文（`group_listen_context`）：未 @ 的消息只进内存缓冲，不触发模型，被 @ 时作为只读上下文拼接
+- 被动收下群文件（`group_file_autosave`）：QQ 群里无法 @ + 附文件，所以收到上传就后台存本地，被 @ 时把本地路径一起给模型
 - 图片和紧随其后的文字可合并为一个 Hermes turn
 - OneBot WebSocket ping/pong、断线重连和 NapCat 健康检查
 - 重连后按白名单目标回补最近一段时间内的消息
@@ -190,9 +191,37 @@ platforms:
 
 - 缓冲按群号隔离，`maxlen` 就是 `group_listen_context`
 - 图片/语音/视频只记占位符（`[图片]`、`[语音]`），不下载，控制缓存和隐私
-- 群文件上传记成 `[文件] 周报.pdf`，同样不下载；要读文件内容仍需 @ 它并发文件
-- 单行截断 200 字符，整体注入上限 1500 字符
+- 单行截断 200 字符，整体注入上限 2500 字符
 - `/new`、`/model` 等命令不拼上下文，保持命令语义
+
+### 群文件：被动收集
+
+QQ 群里**没法 @ 一个人再附一个文件**——发文件就是单独一条文件消息，不会带@。
+所以只回 @ 的模式下，文件原本永远进不了 Hermes。打开 `group_file_autosave` 后：
+
+- 有人往群文件上传 → `group_upload` 通知到达 → 后台异步下载到本地，**不回复、不触发模型**
+- 被 @ 时上下文里写的是带本地路径的条目，模型可以直接读：
+
+```text
+10:32 张三: [文件] 周报.pdf → 已存到本地: ~/.hermes/cache/qq_group_files/1054660428/20261028-103200-周报.pdf
+```
+
+- 重启期间漏掉的 `group_upload` 由 `group_file_backfill` 补：连上就扫一遍群文件列表，只取最近 `group_file_backfill_limit` 个未收录的文件
+- 落盘位置：`~/.hermes/cache/qq_group_files/<群号>/`，索引在 `index.json`（按 `群号:file_id` 去重，重启不重复下载）
+- 超过 `group_file_max_mb` 的文件不下载，上下文里标一句「超过本地保存上限」
+- `group_file_retention_days` 到了自动清理（启动后首次文件操作时扫一次）
+
+```yaml
+platforms:
+  qq:
+    extra:
+      group_listen_context: 15
+      group_file_autosave: true
+      group_file_backfill: true
+      group_file_backfill_limit: 10
+      group_file_max_mb: 30
+      group_file_retention_days: 30
+```
 
 生产或个人部署建议使用 `allowlist`，不要在公网暴露无鉴权的 OneBot HTTP 端口。
 

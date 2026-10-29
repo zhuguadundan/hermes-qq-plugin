@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import time
 from pathlib import Path
 
 from gateway.config import PlatformConfig
@@ -13,6 +14,7 @@ class FakeNapCatClient:
         self.segments = []
         self.group_history = []
         self.friend_history = []
+        self.group_files = []
 
     def upload_file_stream(self, local_path: str) -> str:
         self.uploads.append(local_path)
@@ -36,6 +38,13 @@ class FakeNapCatClient:
     def get_group_msg_history(self, group_id: str, count: int = 20):
         self.calls.append(("get_group_msg_history", {"group_id": group_id, "count": count}))
         return self.group_history[-count:]
+    def get_group_root_files(self, group_id: str):
+        self.calls.append(("get_group_root_files", {"group_id": group_id}))
+        return {"files": self.group_files, "folders": []}
+
+    def get_group_file_url(self, group_id: str, file_id: str, busid=None):
+        self.calls.append(("get_group_file_url", {"group_id": group_id, "file_id": file_id, "busid": busid}))
+        return {"url": f"https://cdn.example/{file_id}?busid={busid}"}
 
     def get_friend_msg_history(self, user_id: str, count: int = 20):
         self.calls.append(("get_friend_msg_history", {"user_id": user_id, "count": count}))
@@ -271,8 +280,18 @@ def _feed(adapter, events):
             await adapter._handle_onebot_event(event)
         for _ in range(5):
             await asyncio.sleep(0)
+        # Let background group-file downloads finish (they use to_thread).
+        for _ in range(400):
+            if not adapter._group_file_tasks:
+                break
+            await asyncio.sleep(0.01)
 
     asyncio.run(go())
+
+
+def _isolated_group_file_root(adapter, tmp_path):
+    adapter._group_file_root = lambda: tmp_path  # type: ignore[method-assign]
+    return tmp_path
 
 
 def test_listen_mode_does_not_trigger_a_turn_for_plain_group_messages():
@@ -328,8 +347,17 @@ def test_listen_backlog_respects_configured_window():
     assert "共 3 条" in text
 
 
-def test_group_file_upload_is_recorded_without_reply_or_download():
+def test_group_file_upload_is_collected_without_triggering_a_reply(tmp_path):
     adapter, fake, handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    downloads = []
+
+    def fake_fetch(url, dest, max_bytes):
+        downloads.append(url)
+        dest.write_bytes(b"%PDF-1.4 weekly report")
+        return dest.stat().st_size
+
+    adapter._fetch_group_file = fake_fetch  # type: ignore[method-assign]
 
     upload = {
         "post_type": "notice",
@@ -337,14 +365,130 @@ def test_group_file_upload_is_recorded_without_reply_or_download():
         "group_id": "20002",
         "user_id": "10001",
         "time": 9999999999,
-        "file": {"id": "f1", "name": "周报.pdf", "size": 1024},
+        "file": {"id": "f1", "name": "周报.pdf", "size": 1024, "busid": 102},
         "sender": {"user_id": "10001", "nickname": "张三"},
     }
     _feed(adapter, [upload])
 
     assert handled == []
-    assert fake.calls == []  # no get_group_file_url / download attempt
-    assert "[文件] 周报.pdf" in "".join(adapter._passive_backlog["20002"])
+    assert fake.calls == [("get_group_file_url", {"group_id": "20002", "file_id": "f1", "busid": 102})]
+    assert len(downloads) == 1
+
+    saved = list((tmp_path / "20002").glob("*.pdf"))
+    assert len(saved) == 1
+    entry = adapter._passive_backlog["20002"][0]
+    assert entry.attachment == str(saved[0])
+
+    rendered = adapter._render_passive_context("20002")
+    assert "[文件] 周报.pdf" in rendered
+    assert str(saved[0]) in rendered
+    assert "已存到本地" in rendered
+
+
+def test_group_file_size_cap_skips_download(tmp_path):
+    adapter, fake, handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    adapter.group_file_max_bytes = 1024
+    adapter._fetch_group_file = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not download"))  # type: ignore[method-assign]
+
+    upload = {
+        "post_type": "notice",
+        "notice_type": "group_upload",
+        "group_id": "20002",
+        "user_id": "10001",
+        "time": 9999999999,
+        "file": {"id": "f2", "name": "录屏.mp4", "size": 80 * 1024 * 1024, "busid": 102},
+        "sender": {"user_id": "10001", "nickname": "张三"},
+    }
+    _feed(adapter, [upload])
+
+    assert handled == []
+    assert fake.calls == []
+    entry = adapter._passive_backlog["20002"][0]
+    assert entry.attachment is None
+    assert "超过本地保存上限" in (entry.note or "")
+    assert "80.0MB" in (entry.note or "")
+
+
+def test_group_file_index_dedupes_repeated_uploads(tmp_path):
+    adapter, fake, _handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    downloads = []
+
+    def fake_fetch(url, dest, max_bytes):
+        downloads.append(url)
+        dest.write_bytes(b"data")
+        return 4
+
+    adapter._fetch_group_file = fake_fetch  # type: ignore[method-assign]
+
+    def upload(file_id: str, name: str, ts: int):
+        return {
+            "post_type": "notice",
+            "notice_type": "group_upload",
+            "group_id": "20002",
+            "user_id": "10001",
+            "time": ts,
+            "file": {"id": file_id, "name": name, "size": 10, "busid": 102},
+            "sender": {"user_id": "10001", "nickname": "张三"},
+        }
+
+    # Two distinct events (different timestamps so transport dedupe does not
+    # apply) referencing the same group file id.
+    _feed(adapter, [upload("f3", "方案.docx", 9999999999), upload("f3", "方案.docx", 9999999998)])
+
+    assert len(downloads) == 1
+    assert [c[0] for c in fake.calls] == ["get_group_file_url"]
+    # The index survives on disk, so a fresh adapter reuses the cached path.
+    assert (tmp_path / "index.json").exists()
+    fresh, fresh_fake, _ = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(fresh, tmp_path)
+    fresh._fetch_group_file = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not re-download"))  # type: ignore[method-assign]
+    _feed(fresh, [upload("f3", "方案.docx", 9999999997)])
+    assert fresh_fake.calls == []
+    assert fresh._passive_backlog["20002"][0].attachment
+
+
+def test_group_file_autosave_can_be_disabled(tmp_path):
+    adapter, fake, handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    adapter.group_file_autosave = False
+
+    upload = {
+        "post_type": "notice",
+        "notice_type": "group_upload",
+        "group_id": "20002",
+        "user_id": "10001",
+        "time": 9999999999,
+        "file": {"id": "f4", "name": "周报.pdf", "size": 10, "busid": 102},
+        "sender": {"user_id": "10001", "nickname": "张三"},
+    }
+    _feed(adapter, [upload])
+
+    assert handled == []
+    assert fake.calls == []
+    entry = adapter._passive_backlog["20002"][0]
+    assert entry.attachment is None
+    assert "[文件] 周报.pdf" in adapter._render_passive_context("20002")
+
+
+def test_group_file_sweep_removes_expired_files(tmp_path):
+    import os
+
+    adapter, _fake, _handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    old_dir = tmp_path / "20002"
+    old_dir.mkdir(parents=True)
+    stale = old_dir / "20260101-000000-old.pdf"
+    stale.write_bytes(b"old")
+    os.utime(stale, (time.time() - 30 * 86400, time.time() - 30 * 86400))
+    adapter._group_file_index = {"20002:f9": {"name": "old.pdf", "path": str(stale), "ts": 1}}
+    adapter.group_file_retention_days = 7
+
+    adapter._sweep_group_file_cache()
+
+    assert not stale.exists()
+    assert adapter._group_file_index == {}
 
 
 def test_listen_mode_keeps_slash_commands_working():
@@ -360,3 +504,81 @@ def test_listen_mode_keeps_slash_commands_working():
 
     assert [event.text for event in handled] == ["/new"]
     assert handled[0].is_command()
+
+
+def test_group_file_backfill_collects_recent_files_once(tmp_path):
+    adapter, fake, handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    adapter._group_policy = "allowlist"
+    adapter._group_allow_from = ["20002"]
+    adapter.group_file_backfill_limit = 5
+    downloads = []
+
+    def fake_fetch(url, dest, max_bytes):
+        downloads.append(url)
+        dest.write_bytes(b"xls")
+        return 3
+
+    adapter._fetch_group_file = fake_fetch  # type: ignore[method-assign]
+    fake.group_files = [
+        {"file_id": "a1", "file_name": "旧表.xlsx", "size": 3, "busid": 102, "modify_time": 100, "uploader_name": "官方瓜", "uploader": 4015317804},
+        {"file_id": "a2", "file_name": "新表.xlsx", "size": 3, "busid": 102, "modify_time": 200, "uploader_name": "大媛", "uploader": 776826706},
+            {"file_id": "a3", "file_name": "超大.zip", "size": 999 * 1024 * 1024, "busid": 102, "modify_time": 300},
+    ]
+
+    asyncio.run(adapter._backfill_group_files())
+
+    assert handled == []
+    # Oversized file is skipped, the two recent ones are saved newest-first.
+    assert len(downloads) == 2
+    assert [e.body for e in adapter._passive_backlog["20002"]] == ["[文件] 新表.xlsx", "[文件] 旧表.xlsx"]
+    assert all(e.attachment and Path(e.attachment).exists() for e in adapter._passive_backlog["20002"])
+    rendered = adapter._render_passive_context("20002")
+    assert "已存到本地" in rendered and "新表.xlsx" in rendered
+
+    # A second scan must not re-download anything (index survives restarts).
+    downloads.clear()
+    asyncio.run(adapter._backfill_group_files())
+    assert downloads == []
+    assert len(adapter._passive_backlog["20002"]) == 2
+
+
+def test_group_file_backfill_resurfaces_recently_cached_file_after_restart(tmp_path):
+    import json
+
+    adapter, fake, handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    adapter._group_policy = "allowlist"
+    adapter._group_allow_from = ["20002"]
+    adapter.history_backfill_seconds = 600
+    adapter._fetch_group_file = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not download"))  # type: ignore[method-assign]
+
+    existing = tmp_path / "20002" / "20261029-084400-周报.pdf"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"pdf")
+    (tmp_path / "index.json").write_text(
+        json.dumps(
+            {
+                "20002:b1": {
+                    "name": "周报.pdf",
+                    "path": str(existing),
+                    "size": 3,
+                    "ts": time.time(),
+                    "group_id": "20002",
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    fake.group_files = [
+        {"file_id": "b1", "file_name": "周报.pdf", "size": 3, "busid": 102, "modify_time": int(time.time()), "uploader_name": "张三"},
+    ]
+
+    asyncio.run(adapter._backfill_group_files())
+
+    assert handled == []
+    entries = adapter._passive_backlog["20002"]
+    assert len(entries) == 1
+    assert entries[0].attachment == str(existing)
+    assert entries[0].body == "[文件] 周报.pdf"

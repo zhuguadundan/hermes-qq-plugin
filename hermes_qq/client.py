@@ -94,6 +94,9 @@ class NapCatClient:
         messages = data.get("messages", data) if isinstance(data, dict) else data
         return messages if isinstance(messages, list) else []
 
+    def get_group_root_files(self, group_id: str) -> dict:
+        return self.call("get_group_root_files", {"group_id": str(group_id)}).get("data", {}) or {}
+
     def get_group_msg_history(self, group_id: str, count: int = 20) -> List[dict]:
         data = self.call("get_group_msg_history", {"group_id": group_id, "count": count}).get("data", {})
         messages = data.get("messages", data) if isinstance(data, dict) else data

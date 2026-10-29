@@ -18,6 +18,7 @@ import os
 import re
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -70,6 +71,30 @@ def _entry_matches(entries: List[str], value: str) -> bool:
     return "*" in entries or (bool(value) and value in entries)
 
 
+@dataclass
+class _BacklogEntry:
+    """One passive group message kept for mention-time context.
+
+    Attributes are filled in out of band: a group file upload creates the
+    entry immediately and a background download later attaches either the
+    local path or a short failure note.
+    """
+
+    stamp: str
+    who: str
+    body: str
+    attachment: Optional[str] = None
+    note: Optional[str] = None
+
+    def render(self) -> str:
+        line = f"{self.stamp} {self.who}: {self.body}"
+        if self.attachment:
+            return f"{line} → 已存到本地: {self.attachment}"
+        if self.note:
+            return f"{line} {self.note}"
+        return line
+
+
 class NapCatQQAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = False
     MAX_MESSAGE_LENGTH = 3500
@@ -88,7 +113,19 @@ class NapCatQQAdapter(BasePlatformAdapter):
         # kept in memory and prepended as read-only context when the bot is
         # finally mentioned.  0 disables listening entirely.
         self.group_listen_context = max(0, int(extra.get("group_listen_context") or 0))
-        self._passive_backlog: Dict[str, Deque[str]] = {}
+        self._passive_backlog: Dict[str, Deque["_BacklogEntry"]] = {}
+        # Passive group-file collection.  QQ groups cannot mention-attach a
+        # file, so a bare upload is the only signal; we save it locally while
+        # nobody is talking to us so a later mention can actually read it.
+        self.group_file_autosave = bool(extra.get("group_file_autosave", True))
+        self.group_file_backfill = bool(extra.get("group_file_backfill", True))
+        self.group_file_backfill_limit = max(0, int(extra.get("group_file_backfill_limit", 10)))
+        self.group_file_max_bytes = int(float(extra.get("group_file_max_mb", 30)) * 1024 * 1024)
+        self.group_file_retention_days = float(extra.get("group_file_retention_days", 7))
+        self._group_file_index: Optional[Dict[str, dict]] = None
+        self._group_file_tasks: Dict[str, asyncio.Task] = {}
+        self._group_file_backfill_task: Optional[asyncio.Task] = None
+        self._group_file_swept = False
         self.enable_online_file = bool(extra.get("enable_online_file", True))
         self.history_backfill_count = int(extra.get("history_backfill_count") or 20)
         self.history_backfill_seconds = int(extra.get("history_backfill_seconds") or 600)
@@ -373,6 +410,7 @@ class NapCatQQAdapter(BasePlatformAdapter):
                     self._mark_connected()
                     logger.info("[QQ] WebSocket connected: %s", self.onebot_ws_url)
                     await self._backfill_recent_messages()
+                    self._schedule_group_file_backfill()
                     async for payload in ws:
                         if not self._qq_should_run:
                             break
@@ -683,16 +721,22 @@ class NapCatQQAdapter(BasePlatformAdapter):
         if not backlog:
             return ""
         lines: List[str] = []
-        budget = 1500
-        for line in reversed(list(backlog)):
-            if len(line) > budget:
+        budget = 2500
+        for entry in reversed(list(backlog)):
+            line = entry.render()
+            # Always keep at least one line, even if it is long (file paths matter).
+            if lines and len(line) > budget:
                 break
             lines.append(line)
             budget -= len(line) + 1
         if not lines:
             return ""
         lines.reverse()
-        header = f"[群聊上下文，共 {len(lines)} 条，仅供参考，不要逐条回复，也不要声称自己参与了这些发言]"
+        group_dir = self._group_file_root() / group_id
+        header = (
+            f"[群聊上下文，共 {len(lines)} 条，仅供参考：不要逐条回复，也不要声称自己参与了这些发言；"
+            f"标了本地路径的文件可以直接用文件/终端工具读取；本群已收下的群文件都在 {group_dir}/]"
+        )
         return "\n".join([header] + lines)
 
     def _passive_summary(self, event: dict, source: QQEventSource) -> str:
@@ -722,9 +766,10 @@ class NapCatQQAdapter(BasePlatformAdapter):
     def _record_passive_group_event(self, event: dict, source: QQEventSource) -> None:
         """Remember a group message that was not addressed to the bot.
 
-        Nothing is downloaded and no Hermes turn is created; the message only
-        becomes read-only context for a later mention.  Media is reduced to a
-        placeholder so the backlog stays cheap and PII-light.
+        No Hermes turn is created and no reply is produced; the message only
+        becomes read-only context for a later mention.  Media stays a
+        placeholder, except group files, which are pulled down in the
+        background so a later mention can actually open them.
         """
         if self.group_listen_context <= 0 or not source.group_id:
             return
@@ -734,13 +779,340 @@ class NapCatQQAdapter(BasePlatformAdapter):
         sender = event.get("sender") or {}
         who = str(sender.get("card") or sender.get("nickname") or source.user_id or "?")
         ts = self._event_timestamp(event, time.time())
-        stamp = datetime.fromtimestamp(ts).strftime("%H:%M")
-        line = f"{stamp} {who}: {body}"
-        backlog = self._passive_backlog.get(str(source.group_id))
+        entry = _BacklogEntry(stamp=datetime.fromtimestamp(ts).strftime("%H:%M"), who=who, body=body)
+        group_id = str(source.group_id)
+        backlog = self._passive_backlog.get(group_id)
         if backlog is None:
             backlog = deque(maxlen=self.group_listen_context)
-            self._passive_backlog[str(source.group_id)] = backlog
-        backlog.append(line)
+            self._passive_backlog[group_id] = backlog
+        backlog.append(entry)
+        self._collect_files_for_entry(event, source, entry)
+
+    # ------------------------------------------------------------------
+    # Passive group-file collection
+    # ------------------------------------------------------------------
+
+    def _group_file_root(self) -> Path:
+        try:
+            from hermes_constants import get_hermes_dir
+
+            root = get_hermes_dir("cache/qq_group_files", "qq_group_files")
+        except Exception:
+            root = Path.home() / ".hermes" / "cache" / "qq_group_files"
+        return root
+
+    def _group_file_index_path(self) -> Path:
+        return self._group_file_root() / "index.json"
+
+    def _load_group_file_index(self) -> Dict[str, dict]:
+        if self._group_file_index is not None:
+            return self._group_file_index
+        index: Dict[str, dict] = {}
+        try:
+            path = self._group_file_index_path()
+            if path.exists():
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    index = {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+        except Exception as exc:
+            logger.debug("[QQ] group file index unreadable: %s", exc)
+        self._group_file_index = index
+        return index
+
+    def _save_group_file_index(self) -> None:
+        index = self._group_file_index or {}
+        try:
+            path = self._group_file_index_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(index, ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as exc:
+            logger.debug("[QQ] group file index write failed: %s", exc)
+
+    @staticmethod
+    def _safe_file_name(name: str, max_stem: int = 80) -> str:
+        base = Path(str(name or "file")).name
+        base = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", base).strip(" .") or "file"
+        stem, dot, ext = base.rpartition(".")
+        if dot and 0 < len(ext) <= 10 and stem:
+            return f"{stem[:max_stem]}.{ext}"
+        return base[:max_stem]
+
+    def _sweep_group_file_cache(self) -> None:
+        if self._group_file_swept:
+            return
+        self._group_file_swept = True
+        if self.group_file_retention_days <= 0:
+            return
+        cutoff = time.time() - self.group_file_retention_days * 86400
+        index = self._load_group_file_index()
+        removed = 0
+        for key, meta in list(index.items()):
+            path = Path(str(meta.get("path") or ""))
+            try:
+                if not path.exists() or path.stat().st_mtime < cutoff:
+                    if path.exists():
+                        path.unlink(missing_ok=True)
+                        removed += 1
+                    index.pop(key, None)
+            except OSError:
+                index.pop(key, None)
+        try:
+            for stale in self._group_file_root().rglob("*"):
+                if stale.is_file() and stale.name != "index.json" and stale.stat().st_mtime < cutoff:
+                    stale.unlink(missing_ok=True)
+                    removed += 1
+        except OSError as exc:
+            logger.debug("[QQ] group file sweep skipped: %s", exc)
+        if removed:
+            logger.info("[QQ] Group file cache sweep removed %d expired file(s)", removed)
+        self._save_group_file_index()
+
+    def _collect_files_for_entry(self, event: dict, source: QQEventSource, entry: _BacklogEntry) -> None:
+        if not self.group_file_autosave or not source.group_id:
+            return
+        for seg in self._message_segments(event):
+            if seg.get("type") not in ("file", "onlinefile"):
+                continue
+            data = seg.get("data") or {}
+            file_key = str(data.get("file_id") or data.get("id") or data.get("file") or "") or None
+            if not file_key:
+                entry.note = entry.note or "(无法定位文件)"
+                continue
+            index_key = f"{source.group_id}:{file_key}"
+            index = self._load_group_file_index()
+            cached = index.get(index_key)
+            if cached and cached.get("path") and Path(str(cached["path"])).exists():
+                entry.attachment = str(cached["path"])
+                continue
+            if index_key in self._group_file_tasks:
+                continue
+            task = asyncio.create_task(self._collect_into_entry(source, data, file_key, index_key, entry))
+            self._group_file_tasks[index_key] = task
+            task.add_done_callback(lambda _t, key=index_key: self._group_file_tasks.pop(key, None))
+
+    async def _collect_into_entry(
+        self,
+        source: QQEventSource,
+        data: dict,
+        file_key: str,
+        index_key: str,
+        entry: _BacklogEntry,
+    ) -> None:
+        path, note = await self._download_group_file(source, data, file_key, index_key)
+        if path:
+            entry.attachment = path
+            entry.note = None
+        elif note and not entry.note:
+            entry.note = note
+
+    # ------------------------------------------------------------------
+    # Group file backfill (files uploaded while the gateway was offline)
+    # ------------------------------------------------------------------
+
+    _BACKFILL_TOTAL_BUDGET = 200 * 1024 * 1024
+
+    def _schedule_group_file_backfill(self) -> None:
+        if not self.group_file_autosave or not self.group_file_backfill:
+            return
+        if self.group_file_backfill_limit <= 0 or self._group_policy != "allowlist":
+            return
+        existing = self._group_file_backfill_task
+        if existing and not existing.done():
+            return
+        self._group_file_backfill_task = asyncio.create_task(self._backfill_group_files())
+
+    async def _backfill_group_files(self) -> None:
+        """Pull recent files that are already sitting in the group file list.
+
+        ``group_upload`` notices are only delivered while connected, so anything
+        uploaded during a restart window would otherwise never be seen.
+        """
+        budget = self._BACKFILL_TOTAL_BUDGET
+        recent_cutoff = time.time() - max(self.history_backfill_seconds, 0)
+        for group_id in [g for g in self._group_allow_from if g != "*"]:
+            try:
+                listing = await asyncio.to_thread(self._client.get_group_root_files, group_id)
+            except Exception as exc:
+                logger.debug("[QQ] group file listing failed for %s: %s", group_id, exc)
+                continue
+            files = listing.get("files") if isinstance(listing, dict) else listing
+            if not isinstance(files, list):
+                continue
+            candidates = [f for f in files if isinstance(f, dict)]
+            candidates.sort(key=lambda f: self._event_timestamp({"time": f.get("modify_time") or f.get("upload_time")}), reverse=True)
+            added = 0
+            for info in candidates:
+                if added >= self.group_file_backfill_limit or budget <= 0:
+                    break
+                file_key = str(info.get("file_id") or info.get("id") or "") or None
+                if not file_key:
+                    continue
+                index_key = f"{group_id}:{file_key}"
+                index = self._load_group_file_index()
+                cached = index.get(index_key)
+                if cached and cached.get("path") and Path(str(cached["path"])).exists():
+                    # Already collected: still surface it as recent context so a
+                    # restart does not hide files uploaded moments ago.
+                    modified = self._event_timestamp(
+                        {"time": info.get("modify_time") or info.get("upload_time")}, time.time()
+                    )
+                    if modified >= recent_cutoff:
+                        self._append_backlog_file_entry(
+                            group_id=str(group_id),
+                            stamp=datetime.fromtimestamp(modified).strftime("%H:%M"),
+                            who=str(info.get("uploader_name") or info.get("uploader") or "群文件"),
+                            name=str(info.get("file_name") or cached.get("name") or "文件"),
+                            path=str(cached["path"]),
+                        )
+                    continue
+                size = info.get("size") or info.get("file_size")
+                try:
+                    size_bytes = int(size) if size is not None else 0
+                except (TypeError, ValueError):
+                    size_bytes = 0
+                if size_bytes and size_bytes > budget:
+                    continue
+                data = {
+                    "name": info.get("file_name") or info.get("name"),
+                    "size": size,
+                    "busid": info.get("busid"),
+                    "file_id": file_key,
+                }
+                source = QQEventSource(
+                    user_id=str(info.get("uploader") or ""),
+                    group_id=str(group_id),
+                    message_id=None,
+                    self_id=self.bot_user_id,
+                    raw=info,
+                )
+                path, _note = await self._download_group_file(source, data, file_key, index_key)
+                if not path:
+                    continue
+                budget -= max(size_bytes, 0)
+                added += 1
+                self._append_backlog_file_entry(
+                    group_id=str(group_id),
+                    stamp=datetime.fromtimestamp(
+                        self._event_timestamp({"time": info.get("modify_time") or info.get("upload_time")}, time.time())
+                    ).strftime("%H:%M"),
+                    who=str(info.get("uploader_name") or info.get("uploader") or "群文件"),
+                    name=str(data.get("name") or "文件"),
+                    path=path,
+                )
+            if added:
+                logger.info("[QQ] Group file backfill collected %d file(s) for %s", added, group_id)
+
+    def _append_backlog_file_entry(self, *, group_id: str, stamp: str, who: str, name: str, path: str) -> None:
+        if self.group_listen_context <= 0:
+            return
+        backlog = self._passive_backlog.get(group_id)
+        if backlog is None:
+            backlog = deque(maxlen=self.group_listen_context)
+            self._passive_backlog[group_id] = backlog
+        backlog.append(
+            _BacklogEntry(stamp=stamp, who=who, body=f"[文件] {name}", attachment=path)
+        )
+
+    async def _download_group_file(
+        self,
+        source: QQEventSource,
+        data: dict,
+        file_key: str,
+        index_key: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Save one group file locally.
+
+        Returns ``(path, note)``: exactly one of them is set.  Never raises for
+        ordinary failures — callers record the note in the backlog instead.
+        """
+        name = str(data.get("name") or data.get("file_name") or f"qq_file_{file_key[:12]}")
+        declared = data.get("size") or data.get("file_size")
+        try:
+            declared_bytes = int(declared) if declared is not None else None
+        except (TypeError, ValueError):
+            declared_bytes = None
+        if declared_bytes and self.group_file_max_bytes and declared_bytes > self.group_file_max_bytes:
+            return None, f"({declared_bytes / 1048576:.1f}MB，超过本地保存上限)"
+
+        self._sweep_group_file_cache()
+        group_id = str(source.group_id)
+        target_dir = self._group_file_root() / group_id
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.debug("[QQ] group file dir unavailable: %s", exc)
+            return None, "(本地保存目录不可写)"
+
+        ts = self._event_timestamp(data, time.time())
+        dest = target_dir / f"{datetime.fromtimestamp(ts).strftime('%Y%m%d-%H%M%S')}-{self._safe_file_name(name)}"
+        suffix = 1
+        while dest.exists():
+            dest = target_dir / (
+                f"{datetime.fromtimestamp(ts).strftime('%Y%m%d-%H%M%S')}-{suffix}-{self._safe_file_name(name)}"
+            )
+            suffix += 1
+
+        urls: List[str] = []
+        try:
+            meta = await asyncio.to_thread(
+                self._client.get_group_file_url, group_id, file_key, data.get("busid")
+            )
+            if isinstance(meta, dict):
+                urls.extend(str(meta.get(k)) for k in ("url", "download_url") if meta.get(k))
+        except Exception as exc:
+            logger.debug("[QQ] get_group_file_url failed for %s: %s", name, exc)
+        urls.extend(str(data.get(k)) for k in ("url", "path") if data.get(k))
+
+        for url in urls:
+            if not url.startswith(("http://", "https://")):
+                continue
+            try:
+                size = await asyncio.to_thread(
+                    self._fetch_group_file, url, dest, self.group_file_max_bytes
+                )
+            except Exception as exc:
+                logger.debug("[QQ] group file download failed for %s: %s", name, exc)
+                continue
+            index = self._load_group_file_index()
+            index[index_key] = {
+                "name": name,
+                "path": str(dest),
+                "size": size,
+                "ts": ts,
+                "group_id": group_id,
+                "user_id": source.user_id,
+            }
+            self._save_group_file_index()
+            logger.info("[QQ] Collected group file %s → %s (%d bytes)", name, dest, size)
+            return str(dest), None
+
+        return None, "(未能保存到本地)"
+
+    def _fetch_group_file(self, url: str, dest: Path, max_bytes: int) -> int:
+        """Stream *url* into *dest*, aborting once *max_bytes* is exceeded."""
+        tmp = dest.with_name(dest.name + ".part")
+        total = 0
+        try:
+            with requests.get(url, timeout=self.request_timeout, stream=True) as resp:
+                resp.raise_for_status()
+                with open(tmp, "wb") as handle:
+                    for chunk in resp.iter_content(65536):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if max_bytes and total > max_bytes:
+                            raise ValueError(f"file exceeds local limit of {max_bytes} bytes")
+                        handle.write(chunk)
+            tmp.replace(dest)
+        except BaseException:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return total
 
     def _event_dedupe_key(self, event: dict, source: QQEventSource) -> Optional[str]:
         if source.message_id:
