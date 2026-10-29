@@ -869,6 +869,20 @@ class NapCatQQAdapter(BasePlatformAdapter):
             logger.info("[QQ] Group file cache sweep removed %d expired file(s)", removed)
         self._save_group_file_index()
 
+    @staticmethod
+    def _group_file_key(group_id: str, name: str, size: Any) -> str:
+        """Content-stable cache key for a group file.
+
+        NapCat hands out a fresh ``file_id`` on every ``get_group_root_files``
+        call, so ids cannot be used for dedupe.  Name + size stays stable across
+        calls and across the notice-vs-scan paths.
+        """
+        try:
+            size_part = str(int(size)) if size is not None else "?"
+        except (TypeError, ValueError):
+            size_part = "?"
+        return f"{group_id}|{Path(str(name or '')).name}|{size_part}"
+
     def _collect_files_for_entry(self, event: dict, source: QQEventSource, entry: _BacklogEntry) -> None:
         if not self.group_file_autosave or not source.group_id:
             return
@@ -880,7 +894,10 @@ class NapCatQQAdapter(BasePlatformAdapter):
             if not file_key:
                 entry.note = entry.note or "(无法定位文件)"
                 continue
-            index_key = f"{source.group_id}:{file_key}"
+            name = str(data.get("name") or data.get("file_name") or "")
+            index_key = self._group_file_key(
+                str(source.group_id), name, data.get("size") or data.get("file_size")
+            )
             index = self._load_group_file_index()
             cached = index.get(index_key)
             if cached and cached.get("path") and Path(str(cached["path"])).exists():
@@ -949,7 +966,11 @@ class NapCatQQAdapter(BasePlatformAdapter):
                 file_key = str(info.get("file_id") or info.get("id") or "") or None
                 if not file_key:
                     continue
-                index_key = f"{group_id}:{file_key}"
+                index_key = self._group_file_key(
+                    str(group_id),
+                    str(info.get("file_name") or info.get("name") or ""),
+                    info.get("size") or info.get("file_size"),
+                )
                 index = self._load_group_file_index()
                 cached = index.get(index_key)
                 modified = self._event_timestamp(
@@ -1085,6 +1106,7 @@ class NapCatQQAdapter(BasePlatformAdapter):
                 "ts": ts,
                 "group_id": group_id,
                 "user_id": source.user_id,
+                "file_id": file_key,
             }
             self._save_group_file_index()
             logger.info("[QQ] Collected group file %s → %s (%d bytes)", name, dest, size)

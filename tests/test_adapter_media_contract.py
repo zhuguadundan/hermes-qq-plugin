@@ -564,7 +564,7 @@ def test_group_file_backfill_resurfaces_recently_cached_file_after_restart(tmp_p
     (tmp_path / "index.json").write_text(
         json.dumps(
             {
-                "20002:b1": {
+                adapter._group_file_key("20002", "周报.pdf", 3): {
                     "name": "周报.pdf",
                     "path": str(existing),
                     "size": 3,
@@ -587,3 +587,40 @@ def test_group_file_backfill_resurfaces_recently_cached_file_after_restart(tmp_p
     assert len(entries) == 1
     assert entries[0].attachment == str(existing)
     assert entries[0].body == "[文件] 周报.pdf"
+
+
+def test_group_file_backfill_dedupes_when_napcat_rotates_file_ids(tmp_path):
+    adapter, fake, _handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    adapter._group_policy = "allowlist"
+    adapter._group_allow_from = ["20002"]
+    downloads = []
+
+    def fake_fetch(url, dest, max_bytes):
+        downloads.append(url)
+        dest.write_bytes(b"pdf")
+        return 3
+
+    adapter._fetch_group_file = fake_fetch  # type: ignore[method-assign]
+
+    def listing(file_id: str):
+        return [
+            {
+                "file_id": file_id,  # NapCat hands out a new id on every call
+                "file_name": "周报.pdf",
+                "size": 3,
+                "busid": 102,
+                "modify_time": int(time.time()),
+                "uploader_name": "张三",
+            }
+        ]
+
+    fake.group_files = listing("id-first")
+    asyncio.run(adapter._backfill_group_files())
+    assert len(downloads) == 1
+
+    fake.group_files = listing("id-second")
+    asyncio.run(adapter._backfill_group_files())
+    assert len(downloads) == 1  # no re-download despite the new file_id
+    assert len(adapter._passive_backlog["20002"]) == 1
+    assert len(list((tmp_path / "20002").glob("*.pdf"))) == 1
