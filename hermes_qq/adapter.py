@@ -859,8 +859,17 @@ class NapCatQQAdapter(BasePlatformAdapter):
             except OSError:
                 index.pop(key, None)
         try:
+            stale_parts_cutoff = time.time() - 3600
             for stale in self._group_file_root().rglob("*"):
-                if stale.is_file() and stale.name != "index.json" and stale.stat().st_mtime < cutoff:
+                if not stale.is_file() or stale.name == "index.json":
+                    continue
+                mtime = stale.stat().st_mtime
+                if stale.name.endswith(".part"):
+                    # Leftovers from an interrupted download.
+                    if mtime < stale_parts_cutoff:
+                        stale.unlink(missing_ok=True)
+                    continue
+                if mtime < cutoff:
                     stale.unlink(missing_ok=True)
                     removed += 1
         except OSError as exc:
