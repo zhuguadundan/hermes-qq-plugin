@@ -520,27 +520,32 @@ def test_group_file_backfill_collects_recent_files_once(tmp_path):
         return 3
 
     adapter._fetch_group_file = fake_fetch  # type: ignore[method-assign]
+    now = int(time.time())
     fake.group_files = [
-        {"file_id": "a1", "file_name": "旧表.xlsx", "size": 3, "busid": 102, "modify_time": 100, "uploader_name": "官方瓜", "uploader": 4015317804},
-        {"file_id": "a2", "file_name": "新表.xlsx", "size": 3, "busid": 102, "modify_time": 200, "uploader_name": "大媛", "uploader": 776826706},
-            {"file_id": "a3", "file_name": "超大.zip", "size": 999 * 1024 * 1024, "busid": 102, "modify_time": 300},
+        {"file_id": "a1", "file_name": "昨天.xlsx", "size": 3, "busid": 102, "modify_time": 100, "uploader_name": "官方瓜", "uploader": 4015317804},
+        {"file_id": "a2", "file_name": "刚上传.xlsx", "size": 3, "busid": 102, "modify_time": now - 60, "uploader_name": "大媛", "uploader": 776826706},
+        {"file_id": "a3", "file_name": "超大.zip", "size": 999 * 1024 * 1024, "busid": 102, "modify_time": now},
     ]
 
     asyncio.run(adapter._backfill_group_files())
 
     assert handled == []
-    # Oversized file is skipped, the two recent ones are saved newest-first.
+    # Oversized file is skipped; both normal ones are saved to disk.
     assert len(downloads) == 2
-    assert [e.body for e in adapter._passive_backlog["20002"]] == ["[文件] 新表.xlsx", "[文件] 旧表.xlsx"]
-    assert all(e.attachment and Path(e.attachment).exists() for e in adapter._passive_backlog["20002"])
+    assert len(list((tmp_path / "20002").glob("*"))) == 2
+    # Only the file from the recent window becomes mention-time context.
+    assert [e.body for e in adapter._passive_backlog["20002"]] == ["[文件] 刚上传.xlsx"]
+    entry = adapter._passive_backlog["20002"][0]
+    assert entry.attachment and Path(entry.attachment).exists()
     rendered = adapter._render_passive_context("20002")
-    assert "已存到本地" in rendered and "新表.xlsx" in rendered
+    assert "已存到本地" in rendered and "刚上传.xlsx" in rendered
+    assert "昨天.xlsx" not in rendered
 
     # A second scan must not re-download anything (index survives restarts).
     downloads.clear()
     asyncio.run(adapter._backfill_group_files())
     assert downloads == []
-    assert len(adapter._passive_backlog["20002"]) == 2
+    assert len(adapter._passive_backlog["20002"]) == 1
 
 
 def test_group_file_backfill_resurfaces_recently_cached_file_after_restart(tmp_path):

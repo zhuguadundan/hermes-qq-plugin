@@ -206,7 +206,8 @@ QQ 群里**没法 @ 一个人再附一个文件**——发文件就是单独一�
 10:32 张三: [文件] 周报.pdf → 已存到本地: ~/.hermes/cache/qq_group_files/1054660428/20261028-103200-周报.pdf
 ```
 
-- 重启期间漏掉的 `group_upload` 由 `group_file_backfill` 补：连上就扫一遍群文件列表，只取最近 `group_file_backfill_limit` 个未收录的文件
+- 重启期间漏掉的 `group_upload` 由 `group_file_backfill` 补：连上就扫一遍群文件列表，每次最多收 `group_file_backfill_limit` 个未收录文件（下次连上接着往更早的收，所以反复重启会把整个群文件列表逐步收全，总量由留存天数和单文件上限兜住）
+- 只有落在 `history_backfill_seconds` 窗口内的文件才会进上下文缓冲；更早的文件只在盘上，上下文头部会给出该群的目录路径，模型自己去 `ls` 就能找到
 - 落盘位置：`~/.hermes/cache/qq_group_files/<群号>/`，索引在 `index.json`（按 `群号:file_id` 去重，重启不重复下载）
 - 超过 `group_file_max_mb` 的文件不下载，上下文里标一句「超过本地保存上限」
 - `group_file_retention_days` 到了自动清理（启动后首次文件操作时扫一次）
@@ -218,7 +219,7 @@ platforms:
       group_listen_context: 15
       group_file_autosave: true
       group_file_backfill: true
-      group_file_backfill_limit: 10
+      group_file_backfill_limit: 50
       group_file_max_mb: 30
       group_file_retention_days: 30
 ```

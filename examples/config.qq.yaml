@@ -32,7 +32,7 @@ platforms:
       # a later mention can actually open them.
       group_file_autosave: true
       group_file_backfill: true      # scan the group file list on connect (catches restart gaps)
-      group_file_backfill_limit: 10  # most recent files per group per scan
+      group_file_backfill_limit: 50  # max new files collected per group per scan
       group_file_max_mb: 30          # skip larger files
       group_file_retention_days: 30  # delete collected files after N days
 

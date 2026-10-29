@@ -952,12 +952,13 @@ class NapCatQQAdapter(BasePlatformAdapter):
                 index_key = f"{group_id}:{file_key}"
                 index = self._load_group_file_index()
                 cached = index.get(index_key)
+                modified = self._event_timestamp(
+                    {"time": info.get("modify_time") or info.get("upload_time")}, time.time()
+                )
                 if cached and cached.get("path") and Path(str(cached["path"])).exists():
-                    # Already collected: still surface it as recent context so a
-                    # restart does not hide files uploaded moments ago.
-                    modified = self._event_timestamp(
-                        {"time": info.get("modify_time") or info.get("upload_time")}, time.time()
-                    )
+                    # Already collected: surface it as recent context (so a
+                    # restart does not hide a file uploaded moments ago), but
+                    # never let old files crowd out real chat context.
                     if modified >= recent_cutoff:
                         self._append_backlog_file_entry(
                             group_id=str(group_id),
@@ -992,15 +993,14 @@ class NapCatQQAdapter(BasePlatformAdapter):
                     continue
                 budget -= max(size_bytes, 0)
                 added += 1
-                self._append_backlog_file_entry(
-                    group_id=str(group_id),
-                    stamp=datetime.fromtimestamp(
-                        self._event_timestamp({"time": info.get("modify_time") or info.get("upload_time")}, time.time())
-                    ).strftime("%H:%M"),
-                    who=str(info.get("uploader_name") or info.get("uploader") or "群文件"),
-                    name=str(data.get("name") or "文件"),
-                    path=path,
-                )
+                if modified >= recent_cutoff:
+                    self._append_backlog_file_entry(
+                        group_id=str(group_id),
+                        stamp=datetime.fromtimestamp(modified).strftime("%H:%M"),
+                        who=str(info.get("uploader_name") or info.get("uploader") or "群文件"),
+                        name=str(data.get("name") or "文件"),
+                        path=path,
+                    )
             if added:
                 logger.info("[QQ] Group file backfill collected %d file(s) for %s", added, group_id)
 
@@ -1011,6 +1011,8 @@ class NapCatQQAdapter(BasePlatformAdapter):
         if backlog is None:
             backlog = deque(maxlen=self.group_listen_context)
             self._passive_backlog[group_id] = backlog
+        if any(entry.attachment == path for entry in backlog):
+            return
         backlog.append(
             _BacklogEntry(stamp=stamp, who=who, body=f"[文件] {name}", attachment=path)
         )
