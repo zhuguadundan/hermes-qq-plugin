@@ -33,8 +33,11 @@ platforms:
       group_file_autosave: true
       group_file_backfill: true      # scan the group file list on connect (catches restart gaps)
       group_file_backfill_limit: 50  # max new files collected per group per scan
-      group_file_max_mb: 30          # skip larger files
-      group_file_retention_days: 30  # delete collected files after N days
+      group_file_max_mb: 200         # skip larger files
+      group_file_retention_days: 7   # delete collected files after N days
+      # Context messages expire too, so a quiet group does not inject
+      # day-old chatter the next time someone mentions the bot.
+      group_listen_context_ttl_minutes: 120
 
       # Media and event batching.
       request_timeout: 60

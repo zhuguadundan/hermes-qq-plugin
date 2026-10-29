@@ -192,6 +192,7 @@ platforms:
 - 缓冲按群号隔离，`maxlen` 就是 `group_listen_context`
 - 图片/语音/视频只记占位符（`[图片]`、`[语音]`），不下载，控制缓存和隐私
 - 单行截断 200 字符，整体注入上限 2500 字符
+- 上下文消息有 TTL（`group_listen_context_ttl_minutes`，默认 120 分钟）：群安静两小时后被 @，不会把两小时前的闲聊塞进去；过期条目在追加和注入时清理，健康检查每小时也扫一遍
 - `/new`、`/model` 等命令不拼上下文，保持命令语义
 
 ### 群文件：被动收集
@@ -210,7 +211,7 @@ QQ 群里**没法 @ 一个人再附一个文件**——发文件就是单独一�
 - 只有落在 `history_backfill_seconds` 窗口内的文件才会进上下文缓冲；更早的文件只在盘上，上下文头部会给出该群的目录路径，模型自己去 `ls` 就能找到
 - 落盘位置：`~/.hermes/cache/qq_group_files/<群号>/`，索引在 `index.json`（按 `群号:file_id` 去重，重启不重复下载）
 - 超过 `group_file_max_mb` 的文件不下载，上下文里标一句「超过本地保存上限」
-- `group_file_retention_days` 到了自动清理（启动后首次文件操作时扫一次）
+- `group_file_retention_days` 到了自动清理（文件操作时 + 健康检查每小时扫一次，不用等重启）
 
 ```yaml
 platforms:
@@ -220,8 +221,9 @@ platforms:
       group_file_autosave: true
       group_file_backfill: true
       group_file_backfill_limit: 50
-      group_file_max_mb: 30
-      group_file_retention_days: 30
+      group_file_max_mb: 200
+      group_file_retention_days: 7
+      group_listen_context_ttl_minutes: 120
 ```
 
 生产或个人部署建议使用 `allowlist`，不要在公网暴露无鉴权的 OneBot HTTP 端口。

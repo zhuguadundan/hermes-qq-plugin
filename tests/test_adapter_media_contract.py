@@ -624,3 +624,56 @@ def test_group_file_backfill_dedupes_when_napcat_rotates_file_ids(tmp_path):
     assert len(downloads) == 1  # no re-download despite the new file_id
     assert len(adapter._passive_backlog["20002"]) == 1
     assert len(list((tmp_path / "20002").glob("*.pdf"))) == 1
+
+
+def test_listen_context_expires_after_ttl():
+    adapter, _fake, handled = _mention_only_adapter(listen_context=10)
+    adapter.group_listen_context_ttl_seconds = 120 * 60
+
+    stale_ts = time.time() - 3 * 3600
+    adapter._record_passive_group_event(
+        {
+            "post_type": "message",
+            "message_type": "group",
+            "self_id": "3860875399",
+            "group_id": "20002",
+            "user_id": "10001",
+            "message_id": "old",
+            "time": stale_ts,
+            "message": [{"type": "text", "data": {"text": "三小时前的闲聊"}}],
+            "sender": {"user_id": "10001", "nickname": "张三"},
+        },
+        adapter._build_qq_source({"group_id": "20002", "user_id": "10001", "time": stale_ts}),
+    )
+    # Stale entry is dropped instead of being injected hours later.
+    assert adapter._render_passive_context("20002") == ""
+    assert "20002" not in adapter._passive_backlog
+
+    _feed(adapter, [_group_message("在吗", message_id="m1", at_self=True)])
+    assert handled[0].text == "在吗"
+
+
+def test_file_sweep_runs_at_most_once_per_interval(tmp_path):
+    import os
+
+    adapter, _fake, _handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    stale = tmp_path / "20002" / "old.pdf"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"old")
+    old = time.time() - 30 * 86400
+    os.utime(stale, (old, old))
+    adapter.group_file_retention_days = 7
+
+    adapter._sweep_group_file_cache()
+    assert not stale.exists()
+
+    fresh = tmp_path / "20002" / "fresh.pdf"
+    fresh.write_bytes(b"new")
+    os.utime(fresh, (old, old))
+    adapter._sweep_group_file_cache()  # inside the 1h window → no-op
+    assert fresh.exists()
+
+    os.utime(fresh, (old, old))
+    adapter._sweep_group_file_cache(force=True)
+    assert not fresh.exists()

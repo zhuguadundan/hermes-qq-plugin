@@ -85,6 +85,7 @@ class _BacklogEntry:
     body: str
     attachment: Optional[str] = None
     note: Optional[str] = None
+    ts: float = 0.0
 
     def render(self) -> str:
         line = f"{self.stamp} {self.who}: {self.body}"
@@ -113,6 +114,11 @@ class NapCatQQAdapter(BasePlatformAdapter):
         # kept in memory and prepended as read-only context when the bot is
         # finally mentioned.  0 disables listening entirely.
         self.group_listen_context = max(0, int(extra.get("group_listen_context") or 0))
+        # How long a passive message stays usable as context.  Without this a
+        # quiet group would still inject week-old chatter on the next mention.
+        self.group_listen_context_ttl_seconds = max(
+            0.0, float(extra.get("group_listen_context_ttl_minutes", 120)) * 60
+        )
         self._passive_backlog: Dict[str, Deque["_BacklogEntry"]] = {}
         # Passive group-file collection.  QQ groups cannot mention-attach a
         # file, so a bare upload is the only signal; we save it locally while
@@ -125,7 +131,7 @@ class NapCatQQAdapter(BasePlatformAdapter):
         self._group_file_index: Optional[Dict[str, dict]] = None
         self._group_file_tasks: Dict[str, asyncio.Task] = {}
         self._group_file_backfill_task: Optional[asyncio.Task] = None
-        self._group_file_swept = False
+        self._last_file_sweep = 0.0
         self.enable_online_file = bool(extra.get("enable_online_file", True))
         self.history_backfill_count = int(extra.get("history_backfill_count") or 20)
         self.history_backfill_seconds = int(extra.get("history_backfill_seconds") or 600)
@@ -462,6 +468,13 @@ class NapCatQQAdapter(BasePlatformAdapter):
                         logger.warning("[QQ] NapCat reports account offline: %s", status)
                 except Exception as exc:
                     logger.warning("[QQ] NapCat health check failed: %s", exc)
+                # Expire collected group files / stale context once per hour
+                # even if nobody ever uploads again.
+                try:
+                    self._sweep_group_file_cache()
+                    self._prune_passive_backlog()
+                except Exception as exc:
+                    logger.debug("[QQ] cache maintenance skipped: %s", exc)
         except asyncio.CancelledError:
             return
 
@@ -716,7 +729,24 @@ class NapCatQQAdapter(BasePlatformAdapter):
                     return True
         return False
 
+    def _prune_passive_backlog(self, group_id: Optional[str] = None) -> None:
+        """Drop context messages older than the TTL so a quiet group goes quiet."""
+        if self.group_listen_context_ttl_seconds <= 0:
+            return
+        cutoff = time.time() - self.group_listen_context_ttl_seconds
+        keys = [group_id] if group_id else list(self._passive_backlog)
+        for key in keys:
+            backlog = self._passive_backlog.get(key)
+            if backlog is None:
+                continue
+            fresh = [entry for entry in backlog if entry.ts >= cutoff]
+            backlog.clear()
+            backlog.extend(fresh)
+            if not backlog:
+                self._passive_backlog.pop(key, None)
+
     def _render_passive_context(self, group_id: str) -> str:
+        self._prune_passive_backlog(group_id)
         backlog = self._passive_backlog.get(group_id)
         if not backlog:
             return ""
@@ -779,8 +809,11 @@ class NapCatQQAdapter(BasePlatformAdapter):
         sender = event.get("sender") or {}
         who = str(sender.get("card") or sender.get("nickname") or source.user_id or "?")
         ts = self._event_timestamp(event, time.time())
-        entry = _BacklogEntry(stamp=datetime.fromtimestamp(ts).strftime("%H:%M"), who=who, body=body)
+        entry = _BacklogEntry(
+            stamp=datetime.fromtimestamp(ts).strftime("%H:%M"), who=who, body=body, ts=ts
+        )
         group_id = str(source.group_id)
+        self._prune_passive_backlog(group_id)
         backlog = self._passive_backlog.get(group_id)
         if backlog is None:
             backlog = deque(maxlen=self.group_listen_context)
@@ -839,13 +872,21 @@ class NapCatQQAdapter(BasePlatformAdapter):
             return f"{stem[:max_stem]}.{ext}"
         return base[:max_stem]
 
-    def _sweep_group_file_cache(self) -> None:
-        if self._group_file_swept:
+    _SWEEP_INTERVAL_SECONDS = 3600
+
+    def _sweep_group_file_cache(self, force: bool = False) -> None:
+        """Delete collected files older than the retention window.
+
+        Runs at most once per ``_SWEEP_INTERVAL_SECONDS`` so a long-lived
+        gateway still expires files without waiting for a restart.
+        """
+        now = time.time()
+        if not force and now - self._last_file_sweep < self._SWEEP_INTERVAL_SECONDS:
             return
-        self._group_file_swept = True
+        self._last_file_sweep = now
         if self.group_file_retention_days <= 0:
             return
-        cutoff = time.time() - self.group_file_retention_days * 86400
+        cutoff = now - self.group_file_retention_days * 86400
         index = self._load_group_file_index()
         removed = 0
         for key, meta in list(index.items()):
@@ -937,7 +978,7 @@ class NapCatQQAdapter(BasePlatformAdapter):
     # Group file backfill (files uploaded while the gateway was offline)
     # ------------------------------------------------------------------
 
-    _BACKFILL_TOTAL_BUDGET = 200 * 1024 * 1024
+    _BACKFILL_TOTAL_BUDGET = 1024 * 1024 * 1024
 
     def _schedule_group_file_backfill(self) -> None:
         if not self.group_file_autosave or not self.group_file_backfill:
@@ -996,6 +1037,7 @@ class NapCatQQAdapter(BasePlatformAdapter):
                             who=str(info.get("uploader_name") or info.get("uploader") or "群文件"),
                             name=str(info.get("file_name") or cached.get("name") or "文件"),
                             path=str(cached["path"]),
+                            ts=modified,
                         )
                     continue
                 size = info.get("size") or info.get("file_size")
@@ -1030,13 +1072,24 @@ class NapCatQQAdapter(BasePlatformAdapter):
                         who=str(info.get("uploader_name") or info.get("uploader") or "群文件"),
                         name=str(data.get("name") or "文件"),
                         path=path,
+                        ts=modified,
                     )
             if added:
                 logger.info("[QQ] Group file backfill collected %d file(s) for %s", added, group_id)
 
-    def _append_backlog_file_entry(self, *, group_id: str, stamp: str, who: str, name: str, path: str) -> None:
+    def _append_backlog_file_entry(
+        self,
+        *,
+        group_id: str,
+        stamp: str,
+        who: str,
+        name: str,
+        path: str,
+        ts: Optional[float] = None,
+    ) -> None:
         if self.group_listen_context <= 0:
             return
+        self._prune_passive_backlog(group_id)
         backlog = self._passive_backlog.get(group_id)
         if backlog is None:
             backlog = deque(maxlen=self.group_listen_context)
@@ -1044,7 +1097,13 @@ class NapCatQQAdapter(BasePlatformAdapter):
         if any(entry.attachment == path for entry in backlog):
             return
         backlog.append(
-            _BacklogEntry(stamp=stamp, who=who, body=f"[文件] {name}", attachment=path)
+            _BacklogEntry(
+                stamp=stamp,
+                who=who,
+                body=f"[文件] {name}",
+                attachment=path,
+                ts=time.time() if ts is None else ts,
+            )
         )
 
     async def _download_group_file(
