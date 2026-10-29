@@ -35,6 +35,7 @@ platforms:
       group_file_backfill_limit: 50  # max new files collected per group per scan
       group_file_max_mb: 200         # skip larger files
       group_file_retention_days: 7   # delete collected files after N days
+      group_file_cache_max_gb: 5     # hard backstop: evict oldest when over this
       # Context messages expire too, so a quiet group does not inject
       # day-old chatter the next time someone mentions the bot.
       group_listen_context_ttl_minutes: 120

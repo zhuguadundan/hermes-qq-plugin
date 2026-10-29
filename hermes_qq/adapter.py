@@ -128,6 +128,10 @@ class NapCatQQAdapter(BasePlatformAdapter):
         self.group_file_backfill_limit = max(0, int(extra.get("group_file_backfill_limit", 10)))
         self.group_file_max_bytes = int(float(extra.get("group_file_max_mb", 30)) * 1024 * 1024)
         self.group_file_retention_days = float(extra.get("group_file_retention_days", 7))
+        # Backstop on total cache size.  0 disables it; it never replaces the
+        # retention window, it only evicts oldest-first when retention is not
+        # enough (e.g. a burst of large uploads).
+        self.group_file_cache_max_bytes = int(float(extra.get("group_file_cache_max_gb", 5)) * 1073741824)
         self._group_file_index: Optional[Dict[str, dict]] = None
         self._group_file_tasks: Dict[str, asyncio.Task] = {}
         self._group_file_backfill_task: Optional[asyncio.Task] = None
@@ -931,6 +935,84 @@ class NapCatQQAdapter(BasePlatformAdapter):
         if removed:
             logger.info("[QQ] Group file cache sweep removed %d expired file(s)", removed)
         self._save_group_file_index()
+        # Hard backstop, applied after the normal retention pass: retention is
+        # the primary rule, the size cap only kicks in when it is not enough.
+        self._enforce_cache_size_cap()
+
+    def _cache_index_key_for_path(self, path: Path) -> Optional[str]:
+        index = self._load_group_file_index()
+        target = str(path)
+        for key, meta in index.items():
+            if str(meta.get("path") or "") == target:
+                return key
+        return None
+
+    def _enforce_cache_size_cap(self) -> None:
+        """Evict the oldest collected files while the cache exceeds its cap.
+
+        This is a last-resort guard on top of the retention window: it never
+        shortens retention, it only stops a burst of large uploads from growing
+        the directory without bound.  Evicted files get the same tombstone as
+        retention expiries so the connect scan does not fetch them straight
+        back.
+        """
+        cap = self.group_file_cache_max_bytes
+        if cap <= 0:
+            return
+        root = self._group_file_root()
+        files: List[Tuple[float, int, Path]] = []
+        total = 0
+        try:
+            for path in root.rglob("*"):
+                if not path.is_file() or path.name == "index.json" or path.name.endswith(".part"):
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                files.append((stat.st_mtime, stat.st_size, path))
+                total += stat.st_size
+        except OSError as exc:
+            logger.debug("[QQ] cache size scan failed: %s", exc)
+            return
+        if total <= cap:
+            return
+
+        files.sort(key=lambda item: item[0])
+        index = self._load_group_file_index()
+        now = time.time()
+        evicted = 0
+        freed = 0
+        for mtime, size, path in files:
+            if total <= cap:
+                break
+            key = self._cache_index_key_for_path(path)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug("[QQ] cache eviction failed for %s: %s", path, exc)
+                continue
+            total -= size
+            freed += size
+            evicted += 1
+            if key:
+                meta = index.get(key) or {}
+                index[key] = {
+                    "name": meta.get("name") or path.name,
+                    "size": meta.get("size"),
+                    "group_id": meta.get("group_id"),
+                    "src_mtime": meta.get("src_mtime") or meta.get("ts") or mtime,
+                    "expired_at": now,
+                    "reason": "size-cap",
+                }
+        if evicted:
+            self._save_group_file_index()
+            logger.warning(
+                "[QQ] Group file cache exceeded %.1fGB → evicted %d oldest file(s), freed %.1fMB",
+                cap / 1073741824,
+                evicted,
+                freed / 1048576,
+            )
 
     @staticmethod
     def _group_file_key(group_id: str, name: str, size: Any) -> str:
@@ -1199,6 +1281,10 @@ class NapCatQQAdapter(BasePlatformAdapter):
             }
             self._save_group_file_index()
             logger.info("[QQ] Collected group file %s → %s (%d bytes)", name, dest, size)
+            try:
+                self._enforce_cache_size_cap()
+            except Exception as exc:  # never fail a collection because of eviction
+                logger.debug("[QQ] cache size cap check failed: %s", exc)
             return str(dest), None
 
         return None, "(未能保存到本地)"

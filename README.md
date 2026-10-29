@@ -212,6 +212,7 @@ QQ 群里**没法 @ 一个人再附一个文件**——发文件就是单独一�
 - 落盘位置：`~/.hermes/cache/qq_group_files/<群号>/`，索引在 `index.json`（按 `群号:file_id` 去重，重启不重复下载）
 - 超过 `group_file_max_mb` 的文件不下载，上下文里标一句「超过本地保存上限」
 - `group_file_retention_days` 到了自动清理（文件操作时 + 健康检查每小时扫一次，不用等重启）
+- `group_file_cache_max_gb` 是**后置兜底**：先按留存天数清，清完如果总占用还是超上限，才按最旧优先淘汰到上限以内。它不会缩短留存期，只是防止「突发大文件把目录撑爆」。被淘汰的同样留墓碑（`reason: size-cap`），回扫不会马上又拉一遍
 
 ```yaml
 platforms:
@@ -223,6 +224,7 @@ platforms:
       group_file_backfill_limit: 50
       group_file_max_mb: 200
       group_file_retention_days: 7
+      group_file_cache_max_gb: 5
       group_listen_context_ttl_minutes: 120
 ```
 

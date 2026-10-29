@@ -729,3 +729,84 @@ def test_tombstoned_file_is_not_re_collected_until_it_changes(tmp_path):
     fake.group_files = listing(2000)
     asyncio.run(adapter._backfill_group_files())
     assert len(downloads) == 2
+
+
+def test_cache_size_cap_evicts_oldest_and_keeps_retention_intact(tmp_path):
+    import os
+
+    adapter, _fake, _handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    adapter.group_file_retention_days = 7
+    adapter.group_file_cache_max_bytes = 6  # tiny cap for the test
+
+    group_dir = tmp_path / "20002"
+    group_dir.mkdir(parents=True)
+    now = time.time()
+    oldest = group_dir / "a.bin"
+    middle = group_dir / "b.bin"
+    newest = group_dir / "c.bin"
+    for path, age, payload in ((oldest, 3 * 3600, b"1234"), (middle, 2 * 3600, b"5678"), (newest, 3600, b"9abc")):
+        path.write_bytes(payload)
+        os.utime(path, (now - age, now - age))
+
+    index = {}
+    for path in (oldest, middle, newest):
+        index[adapter._group_file_key("20002", path.name, 4)] = {
+            "name": path.name,
+            "path": str(path),
+            "size": 4,
+            "ts": path.stat().st_mtime,
+            "src_mtime": path.stat().st_mtime,
+            "group_id": "20002",
+        }
+    adapter._group_file_index = index
+
+    adapter._sweep_group_file_cache(force=True)
+
+    # Nothing was old enough for the 7-day rule, so only the size cap acted.
+    assert not oldest.exists()
+    assert not middle.exists()  # still 8 bytes > 6 cap after the first eviction
+    assert newest.exists()
+    assert (group_dir / "c.bin").stat().st_size == 4
+    tomb = adapter._group_file_index[adapter._group_file_key("20002", "a.bin", 4)]
+    assert tomb["reason"] == "size-cap" and "path" not in tomb
+
+
+def test_cache_size_cap_zero_disables_the_backstop(tmp_path):
+    import os
+
+    adapter, _fake, _handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    adapter.group_file_retention_days = 7
+    adapter.group_file_cache_max_bytes = 0
+
+    group_dir = tmp_path / "20002"
+    group_dir.mkdir(parents=True)
+    big = group_dir / "a.bin"
+    big.write_bytes(b"x" * 4096)
+    old = time.time() - 3600
+    os.utime(big, (old, old))
+
+    adapter._sweep_group_file_cache(force=True)
+
+    assert big.exists()
+
+
+def test_retention_still_wins_when_it_is_enough(tmp_path):
+    import os
+
+    adapter, _fake, _handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    adapter.group_file_retention_days = 7
+    adapter.group_file_cache_max_bytes = 10 * 1024 * 1024
+
+    group_dir = tmp_path / "20002"
+    group_dir.mkdir(parents=True)
+    expired = group_dir / "old.bin"
+    expired.write_bytes(b"x" * 1024)
+    ancient = time.time() - 30 * 86400
+    os.utime(expired, (ancient, ancient))
+
+    adapter._sweep_group_file_cache(force=True)
+
+    assert not expired.exists()
