@@ -488,7 +488,9 @@ def test_group_file_sweep_removes_expired_files(tmp_path):
     adapter._sweep_group_file_cache()
 
     assert not stale.exists()
-    assert adapter._group_file_index == {}
+    # The entry survives as a tombstone so the connect scan does not fetch it again.
+    tomb = adapter._group_file_index["20002:f9"]
+    assert "path" not in tomb and tomb["expired_at"] > 0
 
 
 def test_listen_mode_keeps_slash_commands_working():
@@ -677,3 +679,53 @@ def test_file_sweep_runs_at_most_once_per_interval(tmp_path):
     os.utime(fresh, (old, old))
     adapter._sweep_group_file_cache(force=True)
     assert not fresh.exists()
+
+
+def test_tombstoned_file_is_not_re_collected_until_it_changes(tmp_path):
+    import os
+
+    adapter, fake, _handled = _mention_only_adapter(listen_context=10)
+    _isolated_group_file_root(adapter, tmp_path)
+    adapter._group_policy = "allowlist"
+    adapter._group_allow_from = ["20002"]
+    adapter.group_file_retention_days = 7
+    downloads = []
+
+    def fake_fetch(url, dest, max_bytes):
+        downloads.append(url)
+        dest.write_bytes(b"pdf")
+        return 3
+
+    adapter._fetch_group_file = fake_fetch  # type: ignore[method-assign]
+
+    def listing(modify_time: int):
+        return [
+            {
+                "file_id": f"id-{modify_time}",
+                "file_name": "周报.pdf",
+                "size": 3,
+                "busid": 102,
+                "modify_time": modify_time,
+                "uploader_name": "张三",
+            }
+        ]
+
+    fake.group_files = listing(1000)
+    asyncio.run(adapter._backfill_group_files())
+    assert len(downloads) == 1
+
+    saved = next((tmp_path / "20002").glob("*.pdf"))
+    old = time.time() - 30 * 86400
+    os.utime(saved, (old, old))
+    adapter._sweep_group_file_cache(force=True)
+    assert not saved.exists()
+
+    # Same version → not re-downloaded.
+    fake.group_files = listing(1000)
+    asyncio.run(adapter._backfill_group_files())
+    assert len(downloads) == 1
+
+    # Genuinely newer upload of the same name+size → collected again.
+    fake.group_files = listing(2000)
+    asyncio.run(adapter._backfill_group_files())
+    assert len(downloads) == 2

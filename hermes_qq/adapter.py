@@ -873,6 +873,7 @@ class NapCatQQAdapter(BasePlatformAdapter):
         return base[:max_stem]
 
     _SWEEP_INTERVAL_SECONDS = 3600
+    _TOMBSTONE_TTL_SECONDS = 180 * 86400
 
     def _sweep_group_file_cache(self, force: bool = False) -> None:
         """Delete collected files older than the retention window.
@@ -890,13 +891,25 @@ class NapCatQQAdapter(BasePlatformAdapter):
         index = self._load_group_file_index()
         removed = 0
         for key, meta in list(index.items()):
+            if not meta.get("path"):
+                # Tombstone from an earlier sweep: keep it so the connect scan
+                # does not re-download a file we deliberately dropped.
+                if now - float(meta.get("expired_at") or 0) > self._TOMBSTONE_TTL_SECONDS:
+                    index.pop(key, None)
+                continue
             path = Path(str(meta.get("path") or ""))
             try:
                 if not path.exists() or path.stat().st_mtime < cutoff:
                     if path.exists():
                         path.unlink(missing_ok=True)
                         removed += 1
-                    index.pop(key, None)
+                    index[key] = {
+                        "name": meta.get("name"),
+                        "size": meta.get("size"),
+                        "group_id": meta.get("group_id"),
+                        "src_mtime": meta.get("src_mtime") or meta.get("ts"),
+                        "expired_at": now,
+                    }
             except OSError:
                 index.pop(key, None)
         try:
@@ -1026,6 +1039,12 @@ class NapCatQQAdapter(BasePlatformAdapter):
                 modified = self._event_timestamp(
                     {"time": info.get("modify_time") or info.get("upload_time")}, time.time()
                 )
+                if cached and not cached.get("path"):
+                    # Tombstoned by the retention sweep.  Skip the exact same
+                    # version; a genuinely newer upload of the same name+size
+                    # gets collected again.
+                    if self._event_timestamp({"time": cached.get("src_mtime")}) >= modified:
+                        continue
                 if cached and cached.get("path") and Path(str(cached["path"])).exists():
                     # Already collected: surface it as recent context (so a
                     # restart does not hide a file uploaded moments ago), but
@@ -1052,6 +1071,7 @@ class NapCatQQAdapter(BasePlatformAdapter):
                     "size": size,
                     "busid": info.get("busid"),
                     "file_id": file_key,
+                    "modify_time": info.get("modify_time") or info.get("upload_time"),
                 }
                 source = QQEventSource(
                     user_id=str(info.get("uploader") or ""),
@@ -1175,6 +1195,7 @@ class NapCatQQAdapter(BasePlatformAdapter):
                 "group_id": group_id,
                 "user_id": source.user_id,
                 "file_id": file_key,
+                "src_mtime": data.get("modify_time") or ts,
             }
             self._save_group_file_index()
             logger.info("[QQ] Collected group file %s → %s (%d bytes)", name, dest, size)
