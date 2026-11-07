@@ -20,6 +20,8 @@ mkdir -p "${HERMES_ROOT}/gateway/platforms"
 cp "${PLUGIN_DIR}/gateway_platform_shim/qq.py" "${HERMES_ROOT}/gateway/platforms/qq.py"
 "${PYTHON_BIN}" "${PLUGIN_DIR}/scripts/patch_hermes_core.py" "${HERMES_ROOT}"
 "${PYTHON_BIN}" -m py_compile "${HERMES_ROOT}/gateway/platforms/qq.py"
+PYTHONPATH="${HERMES_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" "${PYTHON_BIN}" -c \
+  'from gateway.config import Platform; from gateway.platforms.qq import NapCatQQAdapter; assert Platform.QQ.value == "qq"; assert callable(NapCatQQAdapter)'
 
 echo "Installed Hermes native QQ adapter into ${HERMES_ROOT}."
 echo "Restart Hermes gateway after updating config.yaml: systemctl --user restart hermes-gateway.service"

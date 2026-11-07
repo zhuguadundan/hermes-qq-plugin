@@ -28,28 +28,36 @@ class NapCatClient:
         self._transport_mode: Optional[str] = None
 
     def call(self, action: str, params: Optional[dict] = None) -> dict:
-        payload = params or {}
+        readonly = action.startswith("get_")
+        # Discover routes with a read, never with an uncertain write.
+        if not readonly and self._transport_mode is None:
+            self.call("get_status")
+        modes = [self._transport_mode or "path"]
+        if readonly:
+            modes += [mode for mode in ("path", "root") if mode not in modes]
         errors: List[str] = []
-        modes = [self._transport_mode] if self._transport_mode else []
-        modes += [mode for mode in ("path", "root") if mode not in modes]
         for mode in modes:
             try:
                 if mode == "path":
-                    resp = self.session.post(f"{self.base_url}/{action}", json=payload, timeout=self.timeout)
-                    data = self._parse_response(resp, action, mode)
+                    resp = self.session.post(f"{self.base_url}/{action}", json=params or {}, timeout=self.timeout)
                 else:
                     resp = self.session.post(
                         self.base_url,
-                        json={"action": action, "params": payload, "echo": uuid.uuid4().hex},
+                        json={"action": action, "params": params or {}, "echo": uuid.uuid4().hex},
                         timeout=self.timeout,
                     )
-                    data = self._parse_response(resp, action, mode)
-                    if data.get("message") == "NapCat4 Is Running":
-                        raise QQBridgeError("root endpoint is not an action RPC endpoint")
+                data = self._parse_response(resp, action, mode)
+                if data.get("message") == "NapCat4 Is Running":
+                    raise QQBridgeError("root endpoint is not an action RPC endpoint")
                 self._transport_mode = mode
                 return data
-            except (requests.RequestException, ValueError, QQBridgeError) as exc:
+            except QQBridgeError:
+                # Business failures are not transport negotiation failures.
+                raise
+            except (requests.RequestException, ValueError) as exc:
                 errors.append(f"{mode}: {exc}")
+                if not readonly:
+                    raise QQBridgeError(f"NapCat {action} result unknown; not retried: {exc}") from exc
         raise QQBridgeError(f"NapCat action failed: {action}: {'; '.join(errors)}")
 
     @staticmethod
@@ -58,7 +66,7 @@ class NapCatClient:
         data = resp.json()
         if not isinstance(data, dict):
             raise QQBridgeError(f"{mode} transport returned unexpected payload for {action}: {data!r}")
-        if data.get("status") not in (None, "ok"):
+        if data.get("status") not in (None, "ok") or data.get("retcode", 0) not in (0, "0"):
             raise QQBridgeError(f"{mode} transport returned failure for {action}: {data}")
         return data
 
@@ -95,7 +103,13 @@ class NapCatClient:
         return messages if isinstance(messages, list) else []
 
     def get_group_root_files(self, group_id: str) -> dict:
-        return self.call("get_group_root_files", {"group_id": str(group_id)}).get("data", {}) or {}
+        # NapCat defaults to 50; QQ permits at most 10,000 group files.
+        return self.call("get_group_root_files", {"group_id": str(group_id), "file_count": 10000}).get("data", {}) or {}
+
+    def get_group_files_by_folder(self, group_id: str, folder_id: str) -> dict:
+        return self.call("get_group_files_by_folder", {
+            "group_id": str(group_id), "folder_id": str(folder_id), "file_count": 10000,
+        }).get("data", {}) or {}
 
     def get_group_msg_history(self, group_id: str, count: int = 20) -> List[dict]:
         data = self.call("get_group_msg_history", {"group_id": group_id, "count": count}).get("data", {})

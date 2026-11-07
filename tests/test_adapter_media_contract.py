@@ -429,7 +429,7 @@ def test_group_file_index_dedupes_repeated_uploads(tmp_path):
             "group_id": "20002",
             "user_id": "10001",
             "time": ts,
-            "file": {"id": file_id, "name": name, "size": 10, "busid": 102},
+            "file": {"id": file_id, "name": name, "size": 10, "busid": 102, "modify_time": 1000},
             "sender": {"user_id": "10001", "nickname": "张三"},
         }
 

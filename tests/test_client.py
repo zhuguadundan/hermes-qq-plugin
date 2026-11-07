@@ -35,8 +35,9 @@ def test_send_private_text_uses_onebot_path_transport():
 
     assert result["data"]["message_id"] == 42
     assert fake.headers == {}
-    assert fake.calls[0][0] == "http://127.0.0.1:3000/send_private_msg"
-    assert fake.calls[0][1] == {"message": "hello", "user_id": "10001"}
+    assert fake.calls[0][0].endswith('/get_status')
+    assert fake.calls[-1][0] == "http://127.0.0.1:3000/send_private_msg"
+    assert fake.calls[-1][1] == {"message": "hello", "user_id": "10001"}
 
 
 def test_send_group_text_sets_group_id():
@@ -49,5 +50,6 @@ def test_send_group_text_sets_group_id():
         "hello",
     )
 
-    assert fake.calls[0][0].endswith("/send_group_msg")
-    assert fake.calls[0][1] == {"message": "hello", "group_id": "20002"}
+    assert fake.calls[0][0].endswith('/get_status')
+    assert fake.calls[-1][0].endswith("/send_group_msg")
+    assert fake.calls[-1][1] == {"message": "hello", "group_id": "20002"}

@@ -59,7 +59,13 @@ from hermes_qq import NapCatQQAdapter, check_qq_requirements
 - 找不到标记会显示 `warn: marker not found`；
 - 找不到标记时脚本不会猜测 Hermes 新版本结构，也不会盲目覆盖文件。
 
-因此，`warn` 不是成功。Hermes 升级后必须检查安装输出，并确认上述集成点仍然存在。
+因此，`warn` 不是成功。脚本在补丁后校验 QQ 枚举、工厂、shim、导出、CLI 注册与工具集，必要集成缺失时返回非零退出码；安装器另外实际导入 adapter。Hermes 升级后仍应检查输出及集成测试。
+
+只读检查现有安装：
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python scripts/patch_hermes_core.py --verify-only ~/.hermes/hermes-agent
+```
 
 ## 安装后验证
 

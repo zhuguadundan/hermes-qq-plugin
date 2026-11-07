@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import re
 
 
 def read(path: Path) -> str:
@@ -144,20 +145,44 @@ def patch_display(root: Path) -> None:
     )
 
 
+def verify_core(root: Path) -> list[str]:
+    """Fail clearly when core integration is only partially installed."""
+    files = {}
+    for name in ("gateway/config.py", "gateway/run.py", "gateway/platforms/qq.py",
+                 "gateway/platforms/__init__.py", "hermes_cli/platforms.py", "toolsets.py"):
+        path = root / name
+        files[name] = read(path) if path.is_file() else ""
+    checks = {
+        "Platform.QQ enum": bool(re.search(r'''\bQQ\s*=\s*["']qq["']''', files["gateway/config.py"])),
+        "Gateway QQ factory": "Platform.QQ" in files["gateway/run.py"] and "return NapCatQQAdapter(config)" in files["gateway/run.py"],
+        "external QQ shim": "hermes_qq" in files["gateway/platforms/qq.py"],
+        "QQ platform export": "NapCatQQAdapter" in files["gateway/platforms/__init__.py"],
+        "CLI platform registration": bool(re.search(r'''["']qq["']''', files["hermes_cli/platforms.py"])),
+        "QQ toolset": bool(re.search(r'''["']hermes-qq["']\s*:''', files["toolsets.py"])),
+    }
+    return [name for name, ok in checks.items() if not ok]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("hermes_root", nargs="?", default=str(Path.home() / ".hermes" / "hermes-agent"))
+    parser.add_argument("--verify-only", action="store_true", help="Validate installed integration without editing core")
     args = parser.parse_args()
     root = Path(args.hermes_root).expanduser().resolve()
     if not (root / "gateway" / "run.py").exists():
         raise SystemExit(f"Not a Hermes checkout: {root}")
-    patch_config(root)
-    patch_run(root)
-    patch_platform_exports(root)
-    patch_cli_platforms(root)
-    patch_toolsets(root)
-    patch_display(root)
-    print("done: Hermes core QQ patch pass complete")
+    if not args.verify_only:
+        patch_config(root)
+        patch_run(root)
+        patch_platform_exports(root)
+        patch_cli_platforms(root)
+        patch_toolsets(root)
+        patch_display(root)
+    missing = verify_core(root)
+    if missing:
+        print("ERROR: QQ integration incomplete: " + ", ".join(missing))
+        return 1
+    print("done: Hermes core QQ integration verified")
     return 0
 
 
