@@ -151,6 +151,7 @@ class NapCatQQAdapter(BasePlatformAdapter):
         self._allow_from = _coerce_list(extra.get("allow_from") or extra.get("allowFrom"))
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
         self._allowed_group_users = _coerce_list(extra.get("allowed_group_users"))
+        self._group_ignore_from = _coerce_list(extra.get("group_ignore_from"))
         self._seen_events: Dict[str, float] = {}
         self._target_sequences: Dict[str, int] = {}
         self._pending_batches: Dict[str, MessageEvent] = {}
@@ -708,8 +709,14 @@ class NapCatQQAdapter(BasePlatformAdapter):
         self_id = str(event.get("self_id") or "")
         return bool(sender and self_id and sender == self_id)
 
+    def _is_ignored_group_user(self, user_id: str) -> bool:
+        return _entry_matches(self._group_ignore_from, str(user_id))
+
     def _is_allowed(self, source: QQEventSource) -> bool:
         if source.group_id:
+            # Reject before mention detection, dedupe, context, or media work.
+            if self._is_ignored_group_user(source.user_id):
+                return False
             if self._group_policy == "disabled":
                 return False
             if self._group_policy == "allowlist" and not _entry_matches(self._group_allow_from, source.group_id):
@@ -1118,6 +1125,9 @@ class NapCatQQAdapter(BasePlatformAdapter):
                 )
                 index = self._load_group_file_index()
                 cached = index.get(index_key)
+                # Keep file archiving independent, but do not reintroduce an
+                # ignored sender's uploads through the file-list context path.
+                include_context = not self._is_ignored_group_user(str(info.get("uploader") or ""))
                 modified = self._event_timestamp(
                     {"time": info.get("modify_time") or info.get("upload_time")}, time.time()
                 )
@@ -1131,7 +1141,7 @@ class NapCatQQAdapter(BasePlatformAdapter):
                     # Already collected: surface it as recent context (so a
                     # restart does not hide a file uploaded moments ago), but
                     # never let old files crowd out real chat context.
-                    if modified >= recent_cutoff:
+                    if include_context and modified >= recent_cutoff:
                         self._append_backlog_file_entry(
                             group_id=str(group_id),
                             stamp=datetime.fromtimestamp(modified).strftime("%H:%M"),
@@ -1167,7 +1177,7 @@ class NapCatQQAdapter(BasePlatformAdapter):
                     continue
                 budget -= max(size_bytes, 0)
                 added += 1
-                if modified >= recent_cutoff:
+                if include_context and modified >= recent_cutoff:
                     self._append_backlog_file_entry(
                         group_id=str(group_id),
                         stamp=datetime.fromtimestamp(modified).strftime("%H:%M"),

@@ -17,6 +17,7 @@ platforms:
       group_allow_from:
         - '987654321'               # QQ group id allowed for group chat
       allowed_group_users: []       # optional user-id allowlist inside groups
+      group_ignore_from: []         # ignore group senders by QQ id (e.g. other bots)
 
       # Group behavior.
       group_chat_all: true          # true = respond to all group messages in allowed groups
